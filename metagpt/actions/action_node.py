@@ -8,6 +8,7 @@
 NOTE: You should use typing.List instead of list to do type annotation. Because in the markdown extraction process,
   we can use typing to extract the type of the node, but we cannot use built-in list to extract.
 """
+
 import json
 import re
 import typing
@@ -26,6 +27,7 @@ from metagpt.logs import logger
 from metagpt.provider.postprocess.llm_output_postprocess import llm_output_postprocess
 from metagpt.utils.common import OutputParser, general_after_log
 from metagpt.utils.human_interaction import HumanInteraction
+from metagpt._profiling import label, span
 from metagpt.utils.sanitize import sanitize
 
 
@@ -50,7 +52,9 @@ class FillMode(Enum):
 
 
 LANGUAGE_CONSTRAINT = "Language: Please use the same language as Human INPUT."
-FORMAT_CONSTRAINT = f"Format: output wrapped inside [{TAG}][/{TAG}] like format example, nothing else."
+FORMAT_CONSTRAINT = (
+    f"Format: output wrapped inside [{TAG}][/{TAG}] like format example, nothing else."
+)
 
 
 SIMPLE_TEMPLATE = """
@@ -228,7 +232,10 @@ class ActionNode:
                 if child.children:
                     mapping[key] = _get_mapping(child)
                 else:
-                    mapping[key] = (child.expected_type, Field(default=child.example, description=child.instruction))
+                    mapping[key] = (
+                        child.expected_type,
+                        Field(default=child.example, description=child.instruction),
+                    )
             return mapping
 
         return _get_mapping(self)
@@ -266,7 +273,11 @@ class ActionNode:
                 logger.warning(f"Unrecognized fields: {unrecognized_fields}")
             return values
 
-        validators = {"check_missing_fields_validator": model_validator(mode="before")(check_fields)}
+        validators = {
+            "check_missing_fields_validator": model_validator(mode="before")(
+                check_fields
+            )
+        }
 
         new_fields = {}
         for field_name, field_value in mapping.items():
@@ -366,20 +377,35 @@ class ActionNode:
         text = self.compile_to(nodes, schema, kv_sep)
         return self.tagging(text, schema, tag)
 
-    def compile_instruction(self, schema="markdown", mode="children", tag="", exclude=None) -> str:
+    def compile_instruction(
+        self, schema="markdown", mode="children", tag="", exclude=None
+    ) -> str:
         """compile to raw/json/markdown template with all/root/children nodes"""
         format_func = lambda i: f"{i.expected_type}  # {i.instruction}"
-        return self._compile_f(schema, mode, tag, format_func, kv_sep=": ", exclude=exclude)
+        return self._compile_f(
+            schema, mode, tag, format_func, kv_sep=": ", exclude=exclude
+        )
 
-    def compile_example(self, schema="json", mode="children", tag="", exclude=None) -> str:
+    def compile_example(
+        self, schema="json", mode="children", tag="", exclude=None
+    ) -> str:
         """compile to raw/json/markdown examples with all/root/children nodes"""
 
         # 这里不能使用f-string，因为转译为str后再json.dumps会额外加上引号，无法作为有效的example
         # 错误示例："File list": "['main.py', 'const.py', 'game.py']", 注意这里值不是list，而是str
         format_func = lambda i: i.example
-        return self._compile_f(schema, mode, tag, format_func, kv_sep="\n", exclude=exclude)
+        return self._compile_f(
+            schema, mode, tag, format_func, kv_sep="\n", exclude=exclude
+        )
 
-    def compile(self, context, schema="json", mode="children", template=SIMPLE_TEMPLATE, exclude=[]) -> str:
+    def compile(
+        self,
+        context,
+        schema="json",
+        mode="children",
+        template=SIMPLE_TEMPLATE,
+        exclude=[],
+    ) -> str:
         """
         mode: all/root/children
             mode="children": 编译所有子节点为一个统一模板，包括instruction与example
@@ -406,8 +432,12 @@ class ActionNode:
 
         # FIXME: json instruction会带来格式问题，如："Project name": "web_2048  # 项目名称使用下划线",
         # compile example暂时不支持markdown
-        instruction = self.compile_instruction(schema="markdown", mode=mode, exclude=exclude)
-        example = self.compile_example(schema=schema, tag=TAG, mode=mode, exclude=exclude)
+        instruction = self.compile_instruction(
+            schema="markdown", mode=mode, exclude=exclude
+        )
+        example = self.compile_example(
+            schema=schema, tag=TAG, mode=mode, exclude=exclude
+        )
         # nodes = ", ".join(self.to_dict(mode=mode).keys())
         constraints = [LANGUAGE_CONSTRAINT, FORMAT_CONSTRAINT]
         constraint = "\n".join(constraints)
@@ -436,20 +466,37 @@ class ActionNode:
         timeout=USE_CONFIG_TIMEOUT,
     ) -> (str, BaseModel):
         """Use ActionOutput to wrap the output of aask"""
-        content = await self.llm.aask(prompt, system_msgs, images=images, timeout=timeout)
-        logger.debug(f"llm raw output:\n{content}")
-        output_class = self.create_model_class(output_class_name, output_data_mapping)
-
-        if schema == "json":
-            parsed_data = llm_output_postprocess(
-                output=content, schema=output_class.model_json_schema(), req_key=f"[/{TAG}]"
+        with span(
+            label(
+                "action_node.aask",
+                key=self.key,
+                schema=schema,
+                prompt_chars=len(prompt),
+            ),
+            color="orange",
+        ):
+            content = await self.llm.aask(
+                prompt, system_msgs, images=images, timeout=timeout
             )
-        else:  # using markdown parser
-            parsed_data = OutputParser.parse_data_with_mapping(content, output_data_mapping)
+            logger.debug(f"llm raw output:\n{content}")
+            output_class = self.create_model_class(
+                output_class_name, output_data_mapping
+            )
 
-        logger.debug(f"parsed_data:\n{parsed_data}")
-        instruct_content = output_class(**parsed_data)
-        return content, instruct_content
+            if schema == "json":
+                parsed_data = llm_output_postprocess(
+                    output=content,
+                    schema=output_class.model_json_schema(),
+                    req_key=f"[/{TAG}]",
+                )
+            else:  # using markdown parser
+                parsed_data = OutputParser.parse_data_with_mapping(
+                    content, output_data_mapping
+                )
+
+            logger.debug(f"parsed_data:\n{parsed_data}")
+            instruct_content = output_class(**parsed_data)
+            return content, instruct_content
 
     def get(self, key):
         return self.instruct_content.model_dump()[key]
@@ -466,22 +513,38 @@ class ActionNode:
         self.set_recursive("context", context)
 
     async def simple_fill(
-        self, schema, mode, images: Optional[Union[str, list[str]]] = None, timeout=USE_CONFIG_TIMEOUT, exclude=None
+        self,
+        schema,
+        mode,
+        images: Optional[Union[str, list[str]]] = None,
+        timeout=USE_CONFIG_TIMEOUT,
+        exclude=None,
     ):
-        prompt = self.compile(context=self.context, schema=schema, mode=mode, exclude=exclude)
-        if schema != "raw":
-            mapping = self.get_mapping(mode, exclude=exclude)
-            class_name = f"{self.key}_AN"
-            content, scontent = await self._aask_v1(
-                prompt, class_name, mapping, images=images, schema=schema, timeout=timeout
+        with span(
+            label("action_node.simple_fill", key=self.key, schema=schema, mode=mode),
+            color="orange",
+        ):
+            prompt = self.compile(
+                context=self.context, schema=schema, mode=mode, exclude=exclude
             )
-            self.content = content
-            self.instruct_content = scontent
-        else:
-            self.content = await self.llm.aask(prompt)
-            self.instruct_content = None
+            if schema != "raw":
+                mapping = self.get_mapping(mode, exclude=exclude)
+                class_name = f"{self.key}_AN"
+                content, scontent = await self._aask_v1(
+                    prompt,
+                    class_name,
+                    mapping,
+                    images=images,
+                    schema=schema,
+                    timeout=timeout,
+                )
+                self.content = content
+                self.instruct_content = scontent
+            else:
+                self.content = await self.llm.aask(prompt)
+                self.instruct_content = None
 
-        return self
+            return self
 
     def get_field_name(self):
         """
@@ -509,7 +572,10 @@ class ActionNode:
         Get the field types associated with this ActionNode's Pydantic model.
         """
         model_class = self.create_class()
-        return {field_name: field.annotation for field_name, field in model_class.model_fields.items()}
+        return {
+            field_name: field.annotation
+            for field_name, field in model_class.model_fields.items()
+        }
 
     def xml_compile(self, context):
         """
@@ -531,7 +597,10 @@ class ActionNode:
         return context
 
     async def code_fill(
-        self, context: str, function_name: Optional[str] = None, timeout: int = USE_CONFIG_TIMEOUT
+        self,
+        context: str,
+        function_name: Optional[str] = None,
+        timeout: int = USE_CONFIG_TIMEOUT,
     ) -> Dict[str, str]:
         """
         Fill CodeBlock Using ``` ```
@@ -543,14 +612,18 @@ class ActionNode:
         result = {field_name: extracted_code}
         return result
 
-    async def single_fill(self, context: str, images: Optional[Union[str, list[str]]] = None) -> Dict[str, str]:
+    async def single_fill(
+        self, context: str, images: Optional[Union[str, list[str]]] = None
+    ) -> Dict[str, str]:
         field_name = self.get_field_name()
         prompt = context
         content = await self.llm.aask(prompt, images=images)
         result = {field_name: content}
         return result
 
-    async def xml_fill(self, context: str, images: Optional[Union[str, list[str]]] = None) -> Dict[str, Any]:
+    async def xml_fill(
+        self, context: str, images: Optional[Union[str, list[str]]] = None
+    ) -> Dict[str, Any]:
         """
         Fill context with XML tags and convert according to field types, including string, integer, boolean, list and dict types
         """
@@ -575,7 +648,13 @@ class ActionNode:
                     except ValueError:
                         extracted_data[field_name] = 0  # 或者其他默认值
                 elif field_type == bool:
-                    extracted_data[field_name] = raw_value.lower() in ("true", "yes", "1", "on", "True")
+                    extracted_data[field_name] = raw_value.lower() in (
+                        "true",
+                        "yes",
+                        "1",
+                        "on",
+                        "True",
+                    )
                 elif field_type == list:
                     try:
                         extracted_data[field_name] = eval(raw_value)
@@ -627,40 +706,58 @@ class ActionNode:
         :param exclude: The keys of ActionNode to exclude.
         :return: self
         """
-        self.set_llm(llm)
-        self.set_context(req)
-        if self.schema:
-            schema = self.schema
+        with span(
+            label(
+                "action_node.fill", key=self.key, mode=mode, strgy=strgy, schema=schema
+            ),
+            color="orange",
+        ):
+            self.set_llm(llm)
+            self.set_context(req)
+            if self.schema:
+                schema = self.schema
 
-        if mode == FillMode.CODE_FILL.value:
-            result = await self.code_fill(context, function_name, timeout)
-            self.instruct_content = self.create_class()(**result)
-            return self
+            if mode == FillMode.CODE_FILL.value:
+                result = await self.code_fill(context, function_name, timeout)
+                self.instruct_content = self.create_class()(**result)
+                return self
 
-        elif mode == FillMode.XML_FILL.value:
-            context = self.xml_compile(context=self.context)
-            result = await self.xml_fill(context, images=images)
-            self.instruct_content = self.create_class()(**result)
-            return self
+            elif mode == FillMode.XML_FILL.value:
+                context = self.xml_compile(context=self.context)
+                result = await self.xml_fill(context, images=images)
+                self.instruct_content = self.create_class()(**result)
+                return self
 
-        elif mode == FillMode.SINGLE_FILL.value:
-            result = await self.single_fill(context, images=images)
-            self.instruct_content = self.create_class()(**result)
-            return self
+            elif mode == FillMode.SINGLE_FILL.value:
+                result = await self.single_fill(context, images=images)
+                self.instruct_content = self.create_class()(**result)
+                return self
 
-        if strgy == "simple":
-            return await self.simple_fill(schema=schema, mode=mode, images=images, timeout=timeout, exclude=exclude)
-        elif strgy == "complex":
-            # 这里隐式假设了拥有children
-            tmp = {}
-            for _, i in self.children.items():
-                if exclude and i.key in exclude:
-                    continue
-                child = await i.simple_fill(schema=schema, mode=mode, images=images, timeout=timeout, exclude=exclude)
-                tmp.update(child.instruct_content.model_dump())
-            cls = self._create_children_class()
-            self.instruct_content = cls(**tmp)
-            return self
+            if strgy == "simple":
+                return await self.simple_fill(
+                    schema=schema,
+                    mode=mode,
+                    images=images,
+                    timeout=timeout,
+                    exclude=exclude,
+                )
+            elif strgy == "complex":
+                # 这里隐式假设了拥有children
+                tmp = {}
+                for _, i in self.children.items():
+                    if exclude and i.key in exclude:
+                        continue
+                    child = await i.simple_fill(
+                        schema=schema,
+                        mode=mode,
+                        images=images,
+                        timeout=timeout,
+                        exclude=exclude,
+                    )
+                    tmp.update(child.instruct_content.model_dump())
+                cls = self._create_children_class()
+                self.instruct_content = cls(**tmp)
+                return self
 
     async def human_review(self) -> dict[str, str]:
         review_comments = HumanInteraction().interact_with_instruct_content(
@@ -674,7 +771,10 @@ class ActionNode:
         nodes_output = {}
         for key, value in instruct_content_dict.items():
             child = self.get_child(key)
-            nodes_output[key] = {"value": value, "requirement": child.instruction if child else self.instruction}
+            nodes_output[key] = {
+                "value": value,
+                "requirement": child.instruction if child else self.instruction,
+            }
         return nodes_output
 
     async def auto_review(self, template: str = REVIEW_TEMPLATE) -> dict[str, str]:
@@ -708,7 +808,9 @@ class ActionNode:
 
         exclude_keys = list(set(keys).difference(include_keys))
         output_class_name = f"{self.key}_AN_REVIEW"
-        output_class = self.create_class(class_name=output_class_name, exclude=exclude_keys)
+        output_class = self.create_class(
+            class_name=output_class_name, exclude=exclude_keys
+        )
         parsed_data = llm_output_postprocess(
             output=content, schema=output_class.model_json_schema(), req_key=f"[/{TAG}]"
         )
@@ -726,7 +828,9 @@ class ActionNode:
             logger.warning("There are no review comments")
         return review_comments
 
-    async def review(self, strgy: str = "simple", review_mode: ReviewMode = ReviewMode.AUTO):
+    async def review(
+        self, strgy: str = "simple", review_mode: ReviewMode = ReviewMode.AUTO
+    ):
         """only give the review comment of each exist and mismatch key
 
         :param strgy: simple/complex
@@ -751,13 +855,17 @@ class ActionNode:
 
     async def human_revise(self) -> dict[str, str]:
         review_contents = HumanInteraction().interact_with_instruct_content(
-            instruct_content=self.instruct_content, mapping=self.get_mapping(mode="auto"), interact_type="revise"
+            instruct_content=self.instruct_content,
+            mapping=self.get_mapping(mode="auto"),
+            interact_type="revise",
         )
         # re-fill the ActionNode
         self.update_instruct_content(review_contents)
         return review_contents
 
-    def _makeup_nodes_output_with_comment(self, review_comments: dict[str, str]) -> dict[str, str]:
+    def _makeup_nodes_output_with_comment(
+        self, review_comments: dict[str, str]
+    ) -> dict[str, str]:
         instruct_content_dict = self.instruct_content.model_dump()
         nodes_output = {}
         for key, value in instruct_content_dict.items():
@@ -782,8 +890,12 @@ class ActionNode:
         nodes_output = self._makeup_nodes_output_with_comment(review_comments)
         keys = self.keys()
         exclude_keys = list(set(keys).difference(include_keys))
-        example = self.compile_example(schema="json", mode="auto", tag=TAG, exclude=exclude_keys)
-        instruction = self.compile_instruction(schema="markdown", mode="auto", exclude=exclude_keys)
+        example = self.compile_example(
+            schema="json", mode="auto", tag=TAG, exclude=exclude_keys
+        )
+        instruction = self.compile_instruction(
+            schema="markdown", mode="auto", exclude=exclude_keys
+        )
 
         prompt = template.format(
             nodes_output=json.dumps(nodes_output, ensure_ascii=False),
@@ -797,7 +909,10 @@ class ActionNode:
         output_mapping = self.get_mapping(mode="auto", exclude=exclude_keys)
         output_class_name = f"{self.key}_AN_REVISE"
         content, scontent = await self._aask_v1(
-            prompt=prompt, output_class_name=output_class_name, output_data_mapping=output_mapping, schema="json"
+            prompt=prompt,
+            output_class_name=output_class_name,
+            output_data_mapping=output_mapping,
+            schema="json",
         )
 
         # re-fill the ActionNode
@@ -805,7 +920,9 @@ class ActionNode:
         self.update_instruct_content(sc_dict)
         return sc_dict
 
-    async def simple_revise(self, revise_mode: ReviseMode = ReviseMode.AUTO) -> dict[str, str]:
+    async def simple_revise(
+        self, revise_mode: ReviseMode = ReviseMode.AUTO
+    ) -> dict[str, str]:
         if revise_mode == ReviseMode.HUMAN:
             revise_contents = await self.human_revise()
         else:
@@ -813,7 +930,9 @@ class ActionNode:
 
         return revise_contents
 
-    async def revise(self, strgy: str = "simple", revise_mode: ReviseMode = ReviseMode.AUTO) -> dict[str, str]:
+    async def revise(
+        self, strgy: str = "simple", revise_mode: ReviseMode = ReviseMode.AUTO
+    ) -> dict[str, str]:
         """revise the content of ActionNode and update the instruct_content
 
         :param strgy: simple/complex
@@ -857,10 +976,17 @@ class ActionNode:
             default = field_info.default
 
             # Recursively handle nested models if needed
-            if not isinstance(field_type, typing._GenericAlias) and issubclass(field_type, BaseModel):
+            if not isinstance(field_type, typing._GenericAlias) and issubclass(
+                field_type, BaseModel
+            ):
                 child_node = cls.from_pydantic(field_type, key=field_name)
             else:
-                child_node = cls(key=field_name, expected_type=field_type, instruction=description, example=default)
+                child_node = cls(
+                    key=field_name,
+                    expected_type=field_type,
+                    instruction=description,
+                    example=default,
+                )
 
             root_node.add_child(child_node)
 

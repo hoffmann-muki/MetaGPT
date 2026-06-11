@@ -6,6 +6,7 @@
 @Modified By: mashenquan, 2023/11/21. Fix bug: ReadTimeout.
 @Modified By: mashenquan, 2023/12/1. Fix bug: Unclosed connection caused by openai 0.x.
 """
+
 from __future__ import annotations
 
 import json
@@ -33,6 +34,7 @@ from metagpt.provider.llm_provider_registry import register_provider
 from metagpt.utils.common import CodeParser, decode_image, log_and_reraise
 from metagpt.utils.cost_manager import CostManager
 from metagpt.utils.exceptions import handle_exception
+from metagpt._profiling import label, span
 from metagpt.utils.token_counter import (
     count_message_tokens,
     count_output_tokens,
@@ -89,53 +91,81 @@ class OpenAILLM(BaseLLM):
 
         return params
 
-    async def _achat_completion_stream(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> str:
-        response: AsyncStream[ChatCompletionChunk] = await self.aclient.chat.completions.create(
-            **self._cons_kwargs(messages, timeout=self.get_timeout(timeout)), stream=True
-        )
-        usage = None
-        collected_messages = []
-        collected_reasoning_messages = []
-        has_finished = False
-        async for chunk in response:
-            if not chunk.choices:
-                continue
+    async def _achat_completion_stream(
+        self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT
+    ) -> str:
+        with span(
+            label(
+                "openai.stream_request", provider=type(self).__name__, model=self.model
+            ),
+            color="red",
+        ):
+            response: AsyncStream[ChatCompletionChunk] = (
+                await self.aclient.chat.completions.create(
+                    **self._cons_kwargs(messages, timeout=self.get_timeout(timeout)),
+                    stream=True,
+                )
+            )
+            usage = None
+            collected_messages = []
+            collected_reasoning_messages = []
+            has_finished = False
+            async for chunk in response:
+                if not chunk.choices:
+                    continue
 
-            choice0 = chunk.choices[0]
-            choice_delta = choice0.delta
-            if hasattr(choice_delta, "reasoning_content") and choice_delta.reasoning_content:
-                collected_reasoning_messages.append(choice_delta.reasoning_content)  # for deepseek
-                continue
-            chunk_message = choice_delta.content or ""  # extract the message
-            finish_reason = choice0.finish_reason if hasattr(choice0, "finish_reason") else None
-            log_llm_stream(chunk_message)
-            collected_messages.append(chunk_message)
-            chunk_has_usage = hasattr(chunk, "usage") and chunk.usage
-            if has_finished:
-                # for oneapi, there has a usage chunk after finish_reason not none chunk
-                if chunk_has_usage:
-                    usage = CompletionUsage(**chunk.usage) if isinstance(chunk.usage, dict) else chunk.usage
-            if finish_reason:
-                if chunk_has_usage:
-                    # Some services have usage as an attribute of the chunk, such as Fireworks
-                    usage = CompletionUsage(**chunk.usage) if isinstance(chunk.usage, dict) else chunk.usage
-                elif hasattr(choice0, "usage"):
-                    # The usage of some services is an attribute of chunk.choices[0], such as Moonshot
-                    usage = CompletionUsage(**choice0.usage)
-                has_finished = True
+                choice0 = chunk.choices[0]
+                choice_delta = choice0.delta
+                if (
+                    hasattr(choice_delta, "reasoning_content")
+                    and choice_delta.reasoning_content
+                ):
+                    collected_reasoning_messages.append(
+                        choice_delta.reasoning_content
+                    )  # for deepseek
+                    continue
+                chunk_message = choice_delta.content or ""  # extract the message
+                finish_reason = (
+                    choice0.finish_reason if hasattr(choice0, "finish_reason") else None
+                )
+                log_llm_stream(chunk_message)
+                collected_messages.append(chunk_message)
+                chunk_has_usage = hasattr(chunk, "usage") and chunk.usage
+                if has_finished:
+                    # for oneapi, there has a usage chunk after finish_reason not none chunk
+                    if chunk_has_usage:
+                        usage = (
+                            CompletionUsage(**chunk.usage)
+                            if isinstance(chunk.usage, dict)
+                            else chunk.usage
+                        )
+                if finish_reason:
+                    if chunk_has_usage:
+                        # Some services have usage as an attribute of the chunk, such as Fireworks
+                        usage = (
+                            CompletionUsage(**chunk.usage)
+                            if isinstance(chunk.usage, dict)
+                            else chunk.usage
+                        )
+                    elif hasattr(choice0, "usage"):
+                        # The usage of some services is an attribute of chunk.choices[0], such as Moonshot
+                        usage = CompletionUsage(**choice0.usage)
+                    has_finished = True
 
-        log_llm_stream("\n")
-        full_reply_content = "".join(collected_messages)
-        if collected_reasoning_messages:
-            self.reasoning_content = "".join(collected_reasoning_messages)
-        if not usage:
-            # Some services do not provide the usage attribute, such as OpenAI or OpenLLM
-            usage = self._calc_usage(messages, full_reply_content)
+            log_llm_stream("\n")
+            full_reply_content = "".join(collected_messages)
+            if collected_reasoning_messages:
+                self.reasoning_content = "".join(collected_reasoning_messages)
+            if not usage:
+                # Some services do not provide the usage attribute, such as OpenAI or OpenLLM
+                usage = self._calc_usage(messages, full_reply_content)
 
-        self._update_costs(usage)
-        return full_reply_content
+            self._update_costs(usage)
+            return full_reply_content
 
-    def _cons_kwargs(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT, **extra_kwargs) -> dict:
+    def _cons_kwargs(
+        self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT, **extra_kwargs
+    ) -> dict:
         kwargs = {
             "messages": messages,
             "max_tokens": self._get_max_tokens(messages),
@@ -153,13 +183,26 @@ class OpenAILLM(BaseLLM):
             kwargs.update(extra_kwargs)
         return kwargs
 
-    async def _achat_completion(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> ChatCompletion:
-        kwargs = self._cons_kwargs(messages, timeout=self.get_timeout(timeout))
-        rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
-        self._update_costs(rsp.usage)
-        return rsp
+    async def _achat_completion(
+        self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT
+    ) -> ChatCompletion:
+        with span(
+            label(
+                "openai.request",
+                provider=type(self).__name__,
+                model=self.model,
+                messages=len(messages),
+            ),
+            color="red",
+        ):
+            kwargs = self._cons_kwargs(messages, timeout=self.get_timeout(timeout))
+            rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
+            self._update_costs(rsp.usage)
+            return rsp
 
-    async def acompletion(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> ChatCompletion:
+    async def acompletion(
+        self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT
+    ) -> ChatCompletion:
         return await self._achat_completion(messages, timeout=self.get_timeout(timeout))
 
     @retry(
@@ -169,24 +212,42 @@ class OpenAILLM(BaseLLM):
         retry=retry_if_exception_type(APIConnectionError),
         retry_error_callback=log_and_reraise,
     )
-    async def acompletion_text(self, messages: list[dict], stream=False, timeout=USE_CONFIG_TIMEOUT) -> str:
+    async def acompletion_text(
+        self, messages: list[dict], stream=False, timeout=USE_CONFIG_TIMEOUT
+    ) -> str:
         """when streaming, print each token in place."""
-        if stream:
-            return await self._achat_completion_stream(messages, timeout=timeout)
+        with span(
+            label(
+                "llm.completion",
+                provider=type(self).__name__,
+                model=self.model,
+                messages=len(messages),
+                stream=stream,
+            ),
+            color="red",
+        ):
+            if stream:
+                return await self._achat_completion_stream(messages, timeout=timeout)
 
-        rsp = await self._achat_completion(messages, timeout=self.get_timeout(timeout))
-        return self.get_choice_text(rsp)
+            rsp = await self._achat_completion(
+                messages, timeout=self.get_timeout(timeout)
+            )
+            return self.get_choice_text(rsp)
 
     async def _achat_completion_function(
         self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT, **chat_configs
     ) -> ChatCompletion:
         messages = self.format_msg(messages)
-        kwargs = self._cons_kwargs(messages=messages, timeout=self.get_timeout(timeout), **chat_configs)
+        kwargs = self._cons_kwargs(
+            messages=messages, timeout=self.get_timeout(timeout), **chat_configs
+        )
         rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
         self._update_costs(rsp.usage)
         return rsp
 
-    async def aask_code(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT, **kwargs) -> dict:
+    async def aask_code(
+        self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT, **kwargs
+    ) -> dict:
         """Use function of tools to ask a code.
         Note: Keep kwargs consistent with https://platform.openai.com/docs/api-reference/chat/create
 
@@ -197,7 +258,9 @@ class OpenAILLM(BaseLLM):
         # -> {'language': 'python', 'code': "print('Hello, World!')"}
         """
         if "tools" not in kwargs:
-            configs = {"tools": [{"type": "function", "function": GENERAL_FUNCTION_SCHEMA}]}
+            configs = {
+                "tools": [{"type": "function", "function": GENERAL_FUNCTION_SCHEMA}]
+            }
             kwargs.update(configs)
         rsp = await self._achat_completion_function(messages, **kwargs)
         return self.get_choice_function_arguments(rsp)
@@ -205,11 +268,15 @@ class OpenAILLM(BaseLLM):
     def _parse_arguments(self, arguments: str) -> dict:
         """parse arguments in openai function call"""
         if "language" not in arguments and "code" not in arguments:
-            logger.warning(f"Not found `code`, `language`, We assume it is pure code:\n {arguments}\n. ")
+            logger.warning(
+                f"Not found `code`, `language`, We assume it is pure code:\n {arguments}\n. "
+            )
             return {"language": "python", "code": arguments}
 
         # 匹配language
-        language_pattern = re.compile(r'[\"\']?language[\"\']?\s*:\s*["\']([^"\']+?)["\']', re.DOTALL)
+        language_pattern = re.compile(
+            r'[\"\']?language[\"\']?\s*:\s*["\']([^"\']+?)["\']', re.DOTALL
+        )
         language_match = language_pattern.search(arguments)
         language_value = language_match.group(1) if language_match else "python"
 
@@ -242,18 +309,20 @@ class OpenAILLM(BaseLLM):
         ):
             # reponse is code
             try:
-                return json.loads(message.tool_calls[0].function.arguments, strict=False)
-            except json.decoder.JSONDecodeError as e:
-                error_msg = (
-                    f"Got JSONDecodeError for \n{'--'*40} \n{message.tool_calls[0].function.arguments}, {str(e)}"
+                return json.loads(
+                    message.tool_calls[0].function.arguments, strict=False
                 )
+            except json.decoder.JSONDecodeError as e:
+                error_msg = f"Got JSONDecodeError for \n{'--'*40} \n{message.tool_calls[0].function.arguments}, {str(e)}"
                 logger.error(error_msg)
                 return self._parse_arguments(message.tool_calls[0].function.arguments)
         elif message.tool_calls is None and message.content is not None:
             # reponse is code, fix openai tools_call respond bug,
             # The response content is `code``, but it appears in the content instead of the arguments.
             code_formats = "```"
-            if message.content.startswith(code_formats) and message.content.endswith(code_formats):
+            if message.content.startswith(code_formats) and message.content.endswith(
+                code_formats
+            ):
                 code = CodeParser.parse_code(text=message.content)
                 return {"language": "python", "code": code}
             # reponse is message
@@ -284,7 +353,9 @@ class OpenAILLM(BaseLLM):
             return self.config.max_token
         # FIXME
         # https://community.openai.com/t/why-is-gpt-3-5-turbo-1106-max-tokens-limited-to-4096/494973/3
-        return min(get_max_completion_tokens(messages, self.model, self.config.max_token), 4096)
+        return min(
+            get_max_completion_tokens(messages, self.model, self.config.max_token), 4096
+        )
 
     @handle_exception
     async def amoderation(self, content: Union[str, list[str]]):
@@ -312,7 +383,12 @@ class OpenAILLM(BaseLLM):
         if not model:
             model = self.model
         res = await self.aclient.images.generate(
-            model=model, prompt=prompt, size=size, quality=quality, n=1, response_format=resp_format
+            model=model,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            n=1,
+            response_format=resp_format,
         )
         imgs = []
         for item in res.data:

@@ -27,6 +27,7 @@ from metagpt.utils.common import (
     serialize_decorator,
     write_json_file,
 )
+from metagpt._profiling import label, span
 
 
 class Team(BaseModel):
@@ -71,7 +72,8 @@ class Team(BaseModel):
         team_info_path = stg_path.joinpath("team.json")
         if not team_info_path.exists():
             raise FileNotFoundError(
-                "recover storage meta file `team.json` not exist, " "not to recover and please start a new project."
+                "recover storage meta file `team.json` not exist, "
+                "not to recover and please start a new project."
             )
 
         team_info: dict = read_json_file(team_info_path)
@@ -97,7 +99,10 @@ class Team(BaseModel):
 
     def _check_balance(self):
         if self.cost_manager.total_cost >= self.cost_manager.max_budget:
-            raise NoMoneyException(self.cost_manager.total_cost, f"Insufficient funds: {self.cost_manager.max_budget}")
+            raise NoMoneyException(
+                self.cost_manager.total_cost,
+                f"Insufficient funds: {self.cost_manager.max_budget}",
+            )
 
     def run_project(self, idea, send_to: str = ""):
         """Run a project from publishing user requirement."""
@@ -122,17 +127,35 @@ class Team(BaseModel):
     @serialize_decorator
     async def run(self, n_round=3, idea="", send_to="", auto_archive=True):
         """Run company until target round or no money"""
-        if idea:
-            self.run_project(idea=idea, send_to=send_to)
+        with span(
+            label("team.run", rounds=n_round, env=type(self.env).__name__), color="blue"
+        ):
+            if idea:
+                with span(label("team.run_project", idea=idea), color="blue"):
+                    self.run_project(idea=idea, send_to=send_to)
 
-        while n_round > 0:
-            if self.env.is_idle:
-                logger.debug("All roles are idle.")
-                break
-            n_round -= 1
-            self._check_balance()
-            await self.env.run()
+            round_idx = 0
+            while n_round > 0:
+                if self.env.is_idle:
+                    logger.debug("All roles are idle.")
+                    break
+                n_round -= 1
+                round_idx += 1
+                active_roles = [
+                    role.name for role in self.env.roles.values() if not role.is_idle
+                ]
+                with span(
+                    label(
+                        "team.round",
+                        index=round_idx,
+                        active_roles=",".join(active_roles),
+                    ),
+                    color="blue",
+                ):
+                    self._check_balance()
+                    await self.env.run()
 
-            logger.debug(f"max {n_round=} left.")
-        self.env.archive(auto_archive)
-        return self.env.history
+                logger.debug(f"max {n_round=} left.")
+            with span(label("team.archive", auto_archive=auto_archive), color="blue"):
+                self.env.archive(auto_archive)
+            return self.env.history

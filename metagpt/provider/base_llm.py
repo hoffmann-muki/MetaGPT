@@ -6,6 +6,7 @@
 @File    : base_llm.py
 @Desc    : mashenquan, 2023/8/22. + try catch
 """
+
 from __future__ import annotations
 
 import json
@@ -29,6 +30,7 @@ from metagpt.logs import logger
 from metagpt.provider.constant import MULTI_MODAL_MODELS
 from metagpt.utils.common import log_and_reraise
 from metagpt.utils.cost_manager import CostManager, Costs
+from metagpt._profiling import label, span
 from metagpt.utils.token_counter import TOKEN_MAX
 
 
@@ -61,7 +63,9 @@ class BaseLLM(ABC):
     def __init__(self, config: LLMConfig):
         pass
 
-    def _user_msg(self, msg: str, images: Optional[Union[str, list[str]]] = None) -> dict[str, Union[str, dict]]:
+    def _user_msg(
+        self, msg: str, images: Optional[Union[str, list[str]]] = None
+    ) -> dict[str, Union[str, dict]]:
         if images and self.support_image_input():
             # as gpt-4v, chat with image
             return self._user_msg_with_imgs(msg, images)
@@ -77,7 +81,9 @@ class BaseLLM(ABC):
         content = [{"type": "text", "text": msg}]
         for image in images:
             # image url or image base64
-            url = image if image.startswith("http") else f"data:image/jpeg;base64,{image}"
+            url = (
+                image if image.startswith("http") else f"data:image/jpeg;base64,{image}"
+            )
             # it can with multiple-image inputs
             content.append({"type": "image_url", "image_url": {"url": url}})
         return {"role": "user", "content": content}
@@ -91,7 +97,9 @@ class BaseLLM(ABC):
     def support_image_input(self) -> bool:
         return any([m in self.model for m in MULTI_MODAL_MODELS])
 
-    def format_msg(self, messages: Union[str, "Message", list[dict], list["Message"], list[str]]) -> list[dict]:
+    def format_msg(
+        self, messages: Union[str, "Message", list[dict], list["Message"], list[str]]
+    ) -> list[dict]:
         """convert messages to list[dict]."""
         from metagpt.schema import Message
 
@@ -107,7 +115,11 @@ class BaseLLM(ABC):
                 processed_messages.append(msg)
             elif isinstance(msg, Message):
                 images = msg.metadata.get(IMAGES)
-                processed_msg = self._user_msg(msg=msg.content, images=images) if images else msg.to_dict()
+                processed_msg = (
+                    self._user_msg(msg=msg.content, images=images)
+                    if images
+                    else msg.to_dict()
+                )
                 processed_messages.append(processed_msg)
             else:
                 raise ValueError(
@@ -121,7 +133,12 @@ class BaseLLM(ABC):
     def _default_system_msg(self):
         return self._system_msg(self.system_prompt)
 
-    def _update_costs(self, usage: Union[dict, BaseModel], model: str = None, local_calc_usage: bool = True):
+    def _update_costs(
+        self,
+        usage: Union[dict, BaseModel],
+        model: str = None,
+        local_calc_usage: bool = True,
+    ):
         """update each request's token cost
         Args:
             model (str): model name or in some scenarios called endpoint
@@ -137,7 +154,9 @@ class BaseLLM(ABC):
                 completion_tokens = int(usage.get("completion_tokens", 0))
                 self.cost_manager.update_cost(prompt_tokens, completion_tokens, model)
             except Exception as e:
-                logger.error(f"{self.__class__.__name__} updates costs failed! exp: {e}")
+                logger.error(
+                    f"{self.__class__.__name__} updates costs failed! exp: {e}"
+                )
 
     def get_costs(self) -> Costs:
         if not self.cost_manager:
@@ -168,12 +187,16 @@ class BaseLLM(ABC):
                     image_url = item.get("image_url", {}).get("url", "")
                     if image_url.startswith(img_base64_prefix):
                         item = item.copy()
-                        item["image_url"] = {"url": "<Image base64 data has been omitted>"}
+                        item["image_url"] = {
+                            "url": "<Image base64 data has been omitted>"
+                        }
                 new_content.append(item)
             new_msg["content"] = new_content
         elif isinstance(content, str) and img_base64_prefix in content:
             # Process plain text messages containing base64 image data
-            new_msg["content"] = "<Messages containing image base64 data have been omitted>"
+            new_msg["content"] = (
+                "<Messages containing image base64 data have been omitted>"
+            )
         return new_msg
 
     async def aask(
@@ -185,45 +208,72 @@ class BaseLLM(ABC):
         timeout=USE_CONFIG_TIMEOUT,
         stream=None,
     ) -> str:
-        if system_msgs:
-            message = self._system_msgs(system_msgs)
-        else:
-            message = [self._default_system_msg()]
-        if not self.use_system_prompt:
-            message = []
-        if format_msgs:
-            message.extend(format_msgs)
-        if isinstance(msg, str):
-            message.append(self._user_msg(msg, images=images))
-        else:
-            message.extend(msg)
-        if stream is None:
-            stream = self.config.stream
+        with span(
+            label(
+                "llm.aask",
+                provider=type(self).__name__,
+                model=self.model,
+                stream=self.config.stream if stream is None else stream,
+            ),
+            color="red",
+        ):
+            if system_msgs:
+                message = self._system_msgs(system_msgs)
+            else:
+                message = [self._default_system_msg()]
+            if not self.use_system_prompt:
+                message = []
+            if format_msgs:
+                message.extend(format_msgs)
+            if isinstance(msg, str):
+                message.append(self._user_msg(msg, images=images))
+            else:
+                message.extend(msg)
+            if stream is None:
+                stream = self.config.stream
 
-        # the image data is replaced with placeholders to avoid long output
-        masked_message = [self.mask_base64_data(m) for m in message]
-        logger.debug(masked_message)
+            # the image data is replaced with placeholders to avoid long output
+            masked_message = [self.mask_base64_data(m) for m in message]
+            logger.debug(masked_message)
 
-        compressed_message = self.compress_messages(message, compress_type=self.config.compress_type)
-        rsp = await self.acompletion_text(compressed_message, stream=stream, timeout=self.get_timeout(timeout))
-        # rsp = await self.acompletion_text(message, stream=stream, timeout=self.get_timeout(timeout))
-        return rsp
+            compressed_message = self.compress_messages(
+                message, compress_type=self.config.compress_type
+            )
+            rsp = await self.acompletion_text(
+                compressed_message, stream=stream, timeout=self.get_timeout(timeout)
+            )
+            # rsp = await self.acompletion_text(message, stream=stream, timeout=self.get_timeout(timeout))
+            return rsp
 
     def _extract_assistant_rsp(self, context):
         return "\n".join([i["content"] for i in context if i["role"] == "assistant"])
 
     async def aask_batch(self, msgs: list, timeout=USE_CONFIG_TIMEOUT) -> str:
         """Sequential questioning"""
-        context = []
-        for msg in msgs:
-            umsg = self._user_msg(msg)
-            context.append(umsg)
-            rsp_text = await self.acompletion_text(context, timeout=self.get_timeout(timeout))
-            context.append(self._assistant_msg(rsp_text))
-        return self._extract_assistant_rsp(context)
+        with span(
+            label(
+                "llm.aask_batch",
+                provider=type(self).__name__,
+                model=self.model,
+                count=len(msgs),
+            ),
+            color="red",
+        ):
+            context = []
+            for msg in msgs:
+                umsg = self._user_msg(msg)
+                context.append(umsg)
+                rsp_text = await self.acompletion_text(
+                    context, timeout=self.get_timeout(timeout)
+                )
+                context.append(self._assistant_msg(rsp_text))
+            return self._extract_assistant_rsp(context)
 
     async def aask_code(
-        self, messages: Union[str, "Message", list[dict]], timeout=USE_CONFIG_TIMEOUT, **kwargs
+        self,
+        messages: Union[str, "Message", list[dict]],
+        timeout=USE_CONFIG_TIMEOUT,
+        **kwargs,
     ) -> dict:
         raise NotImplementedError
 
@@ -243,7 +293,9 @@ class BaseLLM(ABC):
         """
 
     @abstractmethod
-    async def _achat_completion_stream(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT) -> str:
+    async def _achat_completion_stream(
+        self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT
+    ) -> str:
         """_achat_completion_stream implemented by inherited class"""
 
     @retry(
@@ -254,13 +306,30 @@ class BaseLLM(ABC):
         retry_error_callback=log_and_reraise,
     )
     async def acompletion_text(
-        self, messages: list[dict], stream: bool = False, timeout: int = USE_CONFIG_TIMEOUT
+        self,
+        messages: list[dict],
+        stream: bool = False,
+        timeout: int = USE_CONFIG_TIMEOUT,
     ) -> str:
         """Asynchronous version of completion. Return str. Support stream-print"""
-        if stream:
-            return await self._achat_completion_stream(messages, timeout=self.get_timeout(timeout))
-        resp = await self._achat_completion(messages, timeout=self.get_timeout(timeout))
-        return self.get_choice_text(resp)
+        with span(
+            label(
+                "llm.completion",
+                provider=type(self).__name__,
+                model=self.model,
+                messages=len(messages),
+                stream=stream,
+            ),
+            color="red",
+        ):
+            if stream:
+                return await self._achat_completion_stream(
+                    messages, timeout=self.get_timeout(timeout)
+                )
+            resp = await self._achat_completion(
+                messages, timeout=self.get_timeout(timeout)
+            )
+            return self.get_choice_text(resp)
 
     def get_choice_text(self, rsp: dict) -> str:
         """Required to provide the first text of choice"""
@@ -373,7 +442,10 @@ class BaseLLM(ABC):
         compressed.extend(system_msgs)
         current_token_count = self.count_tokens(system_msgs)
 
-        if compress_type in [CompressType.POST_CUT_BY_TOKEN, CompressType.POST_CUT_BY_MSG]:
+        if compress_type in [
+            CompressType.POST_CUT_BY_TOKEN,
+            CompressType.POST_CUT_BY_MSG,
+        ]:
             # Under keep_token constraint, keep as many latest messages as possible
             for i, msg in enumerate(reversed(user_assistant_msgs)):
                 token_count = self.count_tokens([msg])
@@ -381,17 +453,27 @@ class BaseLLM(ABC):
                     compressed.insert(len(system_msgs), msg)
                     current_token_count += token_count
                 else:
-                    if compress_type == CompressType.POST_CUT_BY_TOKEN or len(compressed) == len(system_msgs):
+                    if compress_type == CompressType.POST_CUT_BY_TOKEN or len(
+                        compressed
+                    ) == len(system_msgs):
                         # Truncate the message to fit within the remaining token count; Otherwise, discard the msg. If compressed has no user or assistant message, enforce cutting by token
-                        truncated_content = msg["content"][-(keep_token - current_token_count) :]
-                        compressed.insert(len(system_msgs), {"role": msg["role"], "content": truncated_content})
+                        truncated_content = msg["content"][
+                            -(keep_token - current_token_count) :
+                        ]
+                        compressed.insert(
+                            len(system_msgs),
+                            {"role": msg["role"], "content": truncated_content},
+                        )
                     logger.warning(
                         f"Truncated messages with {compress_type} to fit within the token limit. "
                         f"The first user or assistant message after truncation (originally the {i}-th message from last): {compressed[len(system_msgs)]}."
                     )
                     break
 
-        elif compress_type in [CompressType.PRE_CUT_BY_TOKEN, CompressType.PRE_CUT_BY_MSG]:
+        elif compress_type in [
+            CompressType.PRE_CUT_BY_TOKEN,
+            CompressType.PRE_CUT_BY_MSG,
+        ]:
             # Under keep_token constraint, keep as many earliest messages as possible
             for i, msg in enumerate(user_assistant_msgs):
                 token_count = self.count_tokens([msg])
@@ -399,10 +481,16 @@ class BaseLLM(ABC):
                     compressed.append(msg)
                     current_token_count += token_count
                 else:
-                    if compress_type == CompressType.PRE_CUT_BY_TOKEN or len(compressed) == len(system_msgs):
+                    if compress_type == CompressType.PRE_CUT_BY_TOKEN or len(
+                        compressed
+                    ) == len(system_msgs):
                         # Truncate the message to fit within the remaining token count; Otherwise, discard the msg. If compressed has no user or assistant message, enforce cutting by token
-                        truncated_content = msg["content"][: keep_token - current_token_count]
-                        compressed.append({"role": msg["role"], "content": truncated_content})
+                        truncated_content = msg["content"][
+                            : keep_token - current_token_count
+                        ]
+                        compressed.append(
+                            {"role": msg["role"], "content": truncated_content}
+                        )
                     logger.warning(
                         f"Truncated messages with {compress_type} to fit within the token limit. "
                         f"The last user or assistant message after truncation (originally the {i}-th message): {compressed[-1]}."

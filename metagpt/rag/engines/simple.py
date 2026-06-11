@@ -59,6 +59,7 @@ from metagpt.rag.schema import (
     ParseResultType,
 )
 from metagpt.utils.common import import_class
+from metagpt._profiling import label, span
 
 
 class SimpleEngine(RetrieverQueryEngine):
@@ -113,26 +114,38 @@ class SimpleEngine(RetrieverQueryEngine):
             ranker_configs: Configuration for rankers.
             fs: File system to use.
         """
-        if not input_dir and not input_files:
-            raise ValueError("Must provide either `input_dir` or `input_files`.")
+        with span(
+            label(
+                "rag.from_docs",
+                input_dir=input_dir,
+                input_files=len(input_files or []),
+                retrievers=len(retriever_configs or []),
+            ),
+            color="brown",
+        ):
+            if not input_dir and not input_files:
+                raise ValueError("Must provide either `input_dir` or `input_files`.")
 
-        file_extractor = cls._get_file_extractor()
-        documents = SimpleDirectoryReader(
-            input_dir=input_dir, input_files=input_files, file_extractor=file_extractor, fs=fs
-        ).load_data()
-        cls._fix_document_metadata(documents)
+            file_extractor = cls._get_file_extractor()
+            documents = SimpleDirectoryReader(
+                input_dir=input_dir,
+                input_files=input_files,
+                file_extractor=file_extractor,
+                fs=fs,
+            ).load_data()
+            cls._fix_document_metadata(documents)
 
-        transformations = transformations or cls._default_transformations()
-        nodes = run_transformations(documents, transformations=transformations)
+            transformations = transformations or cls._default_transformations()
+            nodes = run_transformations(documents, transformations=transformations)
 
-        return cls._from_nodes(
-            nodes=nodes,
-            transformations=transformations,
-            embed_model=embed_model,
-            llm=llm,
-            retriever_configs=retriever_configs,
-            ranker_configs=ranker_configs,
-        )
+            return cls._from_nodes(
+                nodes=nodes,
+                transformations=transformations,
+                embed_model=embed_model,
+                llm=llm,
+                retriever_configs=retriever_configs,
+                ranker_configs=ranker_configs,
+            )
 
     @classmethod
     def from_objs(
@@ -154,22 +167,32 @@ class SimpleEngine(RetrieverQueryEngine):
             retriever_configs: Configuration for retrievers. If more than one config, will use SimpleHybridRetriever.
             ranker_configs: Configuration for rankers.
         """
-        objs = objs or []
-        retriever_configs = retriever_configs or []
+        with span(
+            label(
+                "rag.from_objs",
+                objs=len(objs or []),
+                retrievers=len(retriever_configs or []),
+            ),
+            color="brown",
+        ):
+            objs = objs or []
+            retriever_configs = retriever_configs or []
 
-        if not objs and any(isinstance(config, BM25RetrieverConfig) for config in retriever_configs):
-            raise ValueError("In BM25RetrieverConfig, Objs must not be empty.")
+            if not objs and any(
+                isinstance(config, BM25RetrieverConfig) for config in retriever_configs
+            ):
+                raise ValueError("In BM25RetrieverConfig, Objs must not be empty.")
 
-        nodes = cls.get_obj_nodes(objs)
+            nodes = cls.get_obj_nodes(objs)
 
-        return cls._from_nodes(
-            nodes=nodes,
-            transformations=transformations,
-            embed_model=embed_model,
-            llm=llm,
-            retriever_configs=retriever_configs,
-            ranker_configs=ranker_configs,
-        )
+            return cls._from_nodes(
+                nodes=nodes,
+                transformations=transformations,
+                embed_model=embed_model,
+                llm=llm,
+                retriever_configs=retriever_configs,
+                ranker_configs=ranker_configs,
+            )
 
     @classmethod
     def from_index(
@@ -181,8 +204,19 @@ class SimpleEngine(RetrieverQueryEngine):
         ranker_configs: list[BaseRankerConfig] = None,
     ) -> "SimpleEngine":
         """Load from previously maintained index by self.persist(), index_config contains persis_path."""
-        index = get_index(index_config, embed_model=cls._resolve_embed_model(embed_model, [index_config]))
-        return cls._from_index(index, llm=llm, retriever_configs=retriever_configs, ranker_configs=ranker_configs)
+        with span(
+            label("rag.from_index", index=type(index_config).__name__), color="brown"
+        ):
+            index = get_index(
+                index_config,
+                embed_model=cls._resolve_embed_model(embed_model, [index_config]),
+            )
+            return cls._from_index(
+                index,
+                llm=llm,
+                retriever_configs=retriever_configs,
+                ranker_configs=ranker_configs,
+            )
 
     async def asearch(self, content: str, **kwargs) -> str:
         """Inplement tools.SearchInterface"""
@@ -197,28 +231,41 @@ class SimpleEngine(RetrieverQueryEngine):
 
     async def aretrieve(self, query: QueryType) -> list[NodeWithScore]:
         """Allow query to be str."""
-        query_bundle = QueryBundle(query) if isinstance(query, str) else query
+        with span(
+            label(
+                "rag.retrieve",
+                query=query if isinstance(query, str) else type(query).__name__,
+            ),
+            color="brown",
+        ):
+            query_bundle = QueryBundle(query) if isinstance(query, str) else query
 
-        nodes = await super().aretrieve(query_bundle)
-        self._try_reconstruct_obj(nodes)
-        return nodes
+            nodes = await super().aretrieve(query_bundle)
+            self._try_reconstruct_obj(nodes)
+            return nodes
 
     def add_docs(self, input_files: List[Union[str, Path]]):
         """Add docs to retriever. retriever must has add_nodes func."""
-        self._ensure_retriever_modifiable()
+        with span(label("rag.add_docs", input_files=len(input_files)), color="brown"):
+            self._ensure_retriever_modifiable()
 
-        documents = SimpleDirectoryReader(input_files=[str(i) for i in input_files]).load_data()
-        self._fix_document_metadata(documents)
+            documents = SimpleDirectoryReader(
+                input_files=[str(i) for i in input_files]
+            ).load_data()
+            self._fix_document_metadata(documents)
 
-        nodes = run_transformations(documents, transformations=self._transformations)
-        self._save_nodes(nodes)
+            nodes = run_transformations(
+                documents, transformations=self._transformations
+            )
+            self._save_nodes(nodes)
 
     def add_objs(self, objs: list[RAGObject]):
         """Adds objects to the retriever, storing each object's original form in metadata for future reference."""
-        self._ensure_retriever_modifiable()
+        with span(label("rag.add_objs", objs=len(objs)), color="brown"):
+            self._ensure_retriever_modifiable()
 
-        nodes = self.get_obj_nodes(objs)
-        self._save_nodes(nodes)
+            nodes = self.get_obj_nodes(objs)
+            self._save_nodes(nodes)
 
     def persist(self, persist_dir: Union[str, os.PathLike], **kwargs):
         """Persist."""
@@ -260,7 +307,10 @@ class SimpleEngine(RetrieverQueryEngine):
     def get_obj_nodes(objs: Optional[list[RAGObject]] = None) -> list[ObjectNode]:
         """Converts a list of RAGObjects to a list of ObjectNodes."""
 
-        return [ObjectNode(text=obj.rag_key(), metadata=ObjectNode.get_obj_metadata(obj)) for obj in objs]
+        return [
+            ObjectNode(text=obj.rag_key(), metadata=ObjectNode.get_obj_metadata(obj))
+            for obj in objs
+        ]
 
     @classmethod
     def _from_nodes(
@@ -275,7 +325,9 @@ class SimpleEngine(RetrieverQueryEngine):
         embed_model = cls._resolve_embed_model(embed_model, retriever_configs)
         llm = llm or get_rag_llm()
 
-        retriever = get_retriever(configs=retriever_configs, nodes=nodes, embed_model=embed_model)
+        retriever = get_retriever(
+            configs=retriever_configs, nodes=nodes, embed_model=embed_model
+        )
         rankers = get_rankers(configs=ranker_configs, llm=llm)  # Default []
 
         return cls(
@@ -298,7 +350,9 @@ class SimpleEngine(RetrieverQueryEngine):
         embed_model = cls._resolve_embed_model(embed_model, retriever_configs)
         llm = llm or get_rag_llm()
 
-        retriever = get_retriever(configs=retriever_configs, nodes=nodes, embed_model=embed_model)
+        retriever = get_retriever(
+            configs=retriever_configs, nodes=nodes, embed_model=embed_model
+        )
         rankers = get_rankers(configs=ranker_configs, llm=llm)  # Default []
 
         return cls(
@@ -318,7 +372,9 @@ class SimpleEngine(RetrieverQueryEngine):
     ) -> "SimpleEngine":
         llm = llm or get_rag_llm()
 
-        retriever = get_retriever(configs=retriever_configs, index=index)  # Default index.as_retriever
+        retriever = get_retriever(
+            configs=retriever_configs, index=index
+        )  # Default index.as_retriever
         rankers = get_rankers(configs=ranker_configs, llm=llm)  # Default []
 
         return cls(
@@ -352,7 +408,9 @@ class SimpleEngine(RetrieverQueryEngine):
                 )
 
         if not isinstance(self.retriever, required_type):
-            raise TypeError(f"The retriever is not of type {required_type.__name__}: {type(self.retriever)}")
+            raise TypeError(
+                f"The retriever is not of type {required_type.__name__}: {type(self.retriever)}"
+            )
 
     def _save_nodes(self, nodes: list[BaseNode]):
         self.retriever.add_nodes(nodes)
@@ -365,7 +423,9 @@ class SimpleEngine(RetrieverQueryEngine):
         """If node is object, then dynamically reconstruct object, and save object to node.metadata["obj"]."""
         for node in nodes:
             if node.metadata.get("is_obj", False):
-                obj_cls = import_class(node.metadata["obj_cls_name"], node.metadata["obj_mod_name"])
+                obj_cls = import_class(
+                    node.metadata["obj_cls_name"], node.metadata["obj_mod_name"]
+                )
                 obj_dict = json.loads(node.metadata["obj_json"])
                 node.metadata["obj"] = obj_cls(**obj_dict)
 
@@ -376,7 +436,9 @@ class SimpleEngine(RetrieverQueryEngine):
             doc.excluded_embed_metadata_keys.append("file_path")
 
     @staticmethod
-    def _resolve_embed_model(embed_model: BaseEmbedding = None, configs: list[Any] = None) -> BaseEmbedding:
+    def _resolve_embed_model(
+        embed_model: BaseEmbedding = None, configs: list[Any] = None
+    ) -> BaseEmbedding:
         if configs and all(isinstance(c, NoEmbedding) for c in configs):
             return MockEmbedding(embed_dim=1)
 
@@ -404,7 +466,9 @@ class SimpleEngine(RetrieverQueryEngine):
             pdf_parser = OmniParse(
                 api_key=config.omniparse.api_key,
                 base_url=config.omniparse.base_url,
-                parse_options=OmniParseOptions(parse_type=OmniParseType.PDF, result_type=ParseResultType.MD),
+                parse_options=OmniParseOptions(
+                    parse_type=OmniParseType.PDF, result_type=ParseResultType.MD
+                ),
             )
             file_extractor[".pdf"] = pdf_parser
 

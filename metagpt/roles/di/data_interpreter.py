@@ -15,6 +15,7 @@ from metagpt.schema import Message, Task, TaskResult
 from metagpt.strategy.task_type import TaskType
 from metagpt.tools.tool_recommend import BM25ToolRecommender, ToolRecommender
 from metagpt.utils.common import CodeParser
+from metagpt._profiling import label, span
 from metagpt.utils.report import ThoughtReporter
 
 REACT_THINK_PROMPT = """
@@ -40,7 +41,9 @@ class DataInterpreter(Role):
     use_plan: bool = True
     use_reflection: bool = False
     execute_code: ExecuteNbCode = Field(default_factory=ExecuteNbCode, exclude=True)
-    tools: list[str] = []  # Use special symbol ["<all>"] to indicate use of all registered tools
+    tools: list[str] = (
+        []
+    )  # Use special symbol ["<all>"] to indicate use of all registered tools
     tool_recommender: ToolRecommender = None
     react_mode: Literal["plan_and_act", "react"] = "plan_and_act"
     max_react_loop: int = 10  # used for react mode
@@ -48,7 +51,11 @@ class DataInterpreter(Role):
 
     @model_validator(mode="after")
     def set_plan_and_tool(self) -> "Interpreter":
-        self._set_react_mode(react_mode=self.react_mode, max_react_loop=self.max_react_loop, auto_run=self.auto_run)
+        self._set_react_mode(
+            react_mode=self.react_mode,
+            max_react_loop=self.max_react_loop,
+            auto_run=self.auto_run,
+        )
         self.use_plan = (
             self.react_mode == "plan_and_act"
         )  # create a flag for convenience, overwrite any passed-in value
@@ -64,80 +71,128 @@ class DataInterpreter(Role):
 
     async def _think(self) -> bool:
         """Useful in 'react' mode. Use LLM to decide whether and what to do next."""
-        self.user_requirement = self.get_memories()[-1].content
-        context = self.working_memory.get()
+        with span(
+            label("di.think", role=self._setting, mode=self.react_mode), color="teal"
+        ):
+            self.user_requirement = self.get_memories()[-1].content
+            context = self.working_memory.get()
 
-        if not context:
-            # just started the run, we need action certainly
-            self.working_memory.add(self.get_memories()[0])  # add user requirement to working memory
-            self._set_state(0)
-            return True
+            if not context:
+                # just started the run, we need action certainly
+                self.working_memory.add(
+                    self.get_memories()[0]
+                )  # add user requirement to working memory
+                self._set_state(0)
+                return True
 
-        prompt = REACT_THINK_PROMPT.format(user_requirement=self.user_requirement, context=context)
-        async with ThoughtReporter(enable_llm_stream=True):
-            rsp = await self.llm.aask(prompt)
-        rsp_dict = json.loads(CodeParser.parse_code(text=rsp))
-        self.working_memory.add(Message(content=rsp_dict["thoughts"], role="assistant"))
-        need_action = rsp_dict["state"]
-        self._set_state(0) if need_action else self._set_state(-1)
+            prompt = REACT_THINK_PROMPT.format(
+                user_requirement=self.user_requirement, context=context
+            )
+            async with ThoughtReporter(enable_llm_stream=True):
+                rsp = await self.llm.aask(prompt)
+            rsp_dict = json.loads(CodeParser.parse_code(text=rsp))
+            self.working_memory.add(
+                Message(content=rsp_dict["thoughts"], role="assistant")
+            )
+            need_action = rsp_dict["state"]
+            self._set_state(0) if need_action else self._set_state(-1)
 
-        return need_action
+            return need_action
 
     async def _act(self) -> Message:
         """Useful in 'react' mode. Return a Message conforming to Role._act interface."""
-        code, _, _ = await self._write_and_exec_code()
-        return Message(content=code, role="assistant", sent_from=self._setting, cause_by=WriteAnalysisCode)
+        with span(label("di.act", role=self._setting), color="teal"):
+            code, _, _ = await self._write_and_exec_code()
+            return Message(
+                content=code,
+                role="assistant",
+                sent_from=self._setting,
+                cause_by=WriteAnalysisCode,
+            )
 
     async def _plan_and_act(self) -> Message:
-        self._set_state(0)
-        try:
-            rsp = await super()._plan_and_act()
-            await self.execute_code.terminate()
-            return rsp
-        except Exception as e:
-            await self.execute_code.terminate()
-            raise e
+        with span(
+            label(
+                "di.plan_and_act", role=self._setting, reflection=self.use_reflection
+            ),
+            color="teal",
+        ):
+            self._set_state(0)
+            try:
+                rsp = await super()._plan_and_act()
+                await self.execute_code.terminate()
+                return rsp
+            except Exception as e:
+                await self.execute_code.terminate()
+                raise e
 
     async def _act_on_task(self, current_task: Task) -> TaskResult:
         """Useful in 'plan_and_act' mode. Wrap the output in a TaskResult for review and confirmation."""
-        code, result, is_success = await self._write_and_exec_code()
-        task_result = TaskResult(code=code, result=result, is_success=is_success)
-        return task_result
+        with span(
+            label(
+                "di.task",
+                role=self._setting,
+                task_id=getattr(current_task, "task_id", None),
+                task_type=getattr(current_task, "task_type", None),
+            ),
+            color="teal",
+        ):
+            code, result, is_success = await self._write_and_exec_code()
+            task_result = TaskResult(code=code, result=result, is_success=is_success)
+            return task_result
 
     async def _write_and_exec_code(self, max_retry: int = 3):
-        counter = 0
-        success = False
+        with span(
+            label("di.write_and_exec", role=self._setting, max_retry=max_retry),
+            color="teal",
+        ):
+            counter = 0
+            success = False
 
-        # plan info
-        plan_status = self.planner.get_plan_status() if self.use_plan else ""
+            # plan info
+            plan_status = self.planner.get_plan_status() if self.use_plan else ""
 
-        # tool info
-        if self.tool_recommender:
-            context = (
-                self.working_memory.get()[-1].content if self.working_memory.get() else ""
-            )  # thoughts from _think stage in 'react' mode
-            plan = self.planner.plan if self.use_plan else None
-            tool_info = await self.tool_recommender.get_recommended_tool_info(context=context, plan=plan)
-        else:
-            tool_info = ""
+            # tool info
+            if self.tool_recommender:
+                context = (
+                    self.working_memory.get()[-1].content
+                    if self.working_memory.get()
+                    else ""
+                )  # thoughts from _think stage in 'react' mode
+                plan = self.planner.plan if self.use_plan else None
+                tool_info = await self.tool_recommender.get_recommended_tool_info(
+                    context=context, plan=plan
+                )
+            else:
+                tool_info = ""
 
-        # data info
-        await self._check_data()
+            # data info
+            await self._check_data()
 
-        while not success and counter < max_retry:
-            ### write code ###
-            code, cause_by = await self._write_code(counter, plan_status, tool_info)
+            while not success and counter < max_retry:
+                with span(
+                    label("di.retry", role=self._setting, attempt=counter + 1),
+                    color="teal",
+                ):
+                    ### write code ###
+                    code, cause_by = await self._write_code(
+                        counter, plan_status, tool_info
+                    )
 
-            self.working_memory.add(Message(content=code, role="assistant", cause_by=cause_by))
+                    self.working_memory.add(
+                        Message(content=code, role="assistant", cause_by=cause_by)
+                    )
 
-            ### execute code ###
-            result, success = await self.execute_code.run(code)
-            print(result)
+                    ### execute code ###
+                    result, success = await self.execute_code.run(code)
+                    print(result)
 
-            self.working_memory.add(Message(content=result, role="user", cause_by=ExecuteNbCode))
+                    self.working_memory.add(
+                        Message(content=result, role="user", cause_by=ExecuteNbCode)
+                    )
 
-            ### process execution result ###
-            counter += 1
+                    ### process execution result ###
+                    counter += 1
 
             # if not success and counter >= max_retry:
             #     logger.info("coding failed!")
@@ -154,37 +209,45 @@ class DataInterpreter(Role):
         tool_info: str = "",
     ):
         todo = self.rc.todo  # todo is WriteAnalysisCode
-        logger.info(f"ready to {todo.name}")
-        use_reflection = counter > 0 and self.use_reflection  # only use reflection after the first trial
+        with span(
+            label("di.write_code", action=todo.name, attempt=counter + 1), color="teal"
+        ):
+            logger.info(f"ready to {todo.name}")
+            use_reflection = (
+                counter > 0 and self.use_reflection
+            )  # only use reflection after the first trial
 
-        code = await todo.run(
-            user_requirement=self.user_requirement,
-            plan_status=plan_status,
-            tool_info=tool_info,
-            working_memory=self.working_memory.get(),
-            use_reflection=use_reflection,
-        )
+            code = await todo.run(
+                user_requirement=self.user_requirement,
+                plan_status=plan_status,
+                tool_info=tool_info,
+                working_memory=self.working_memory.get(),
+                use_reflection=use_reflection,
+            )
 
-        return code, todo
+            return code, todo
 
     async def _check_data(self):
-        if (
-            not self.use_plan
-            or not self.planner.plan.get_finished_tasks()
-            or self.planner.plan.current_task.task_type
-            not in [
-                TaskType.DATA_PREPROCESS.type_name,
-                TaskType.FEATURE_ENGINEERING.type_name,
-                TaskType.MODEL_TRAIN.type_name,
-            ]
-        ):
-            return
-        logger.info("Check updated data")
-        code = await CheckData().run(self.planner.plan)
-        if not code.strip():
-            return
-        result, success = await self.execute_code.run(code)
-        if success:
-            print(result)
-            data_info = DATA_INFO.format(info=result)
-            self.working_memory.add(Message(content=data_info, role="user", cause_by=CheckData))
+        with span(label("di.check_data", role=self._setting), color="teal"):
+            if (
+                not self.use_plan
+                or not self.planner.plan.get_finished_tasks()
+                or self.planner.plan.current_task.task_type
+                not in [
+                    TaskType.DATA_PREPROCESS.type_name,
+                    TaskType.FEATURE_ENGINEERING.type_name,
+                    TaskType.MODEL_TRAIN.type_name,
+                ]
+            ):
+                return
+            logger.info("Check updated data")
+            code = await CheckData().run(self.planner.plan)
+            if not code.strip():
+                return
+            result, success = await self.execute_code.run(code)
+            if success:
+                print(result)
+                data_info = DATA_INFO.format(info=result)
+                self.working_memory.add(
+                    Message(content=data_info, role="user", cause_by=CheckData)
+                )

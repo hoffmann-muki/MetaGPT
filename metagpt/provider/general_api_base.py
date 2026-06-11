@@ -38,6 +38,8 @@ import logging
 import openai
 from openai import version
 
+from metagpt._profiling import label, span
+
 logger = logging.getLogger("openai")
 
 TIMEOUT_SECS = 600
@@ -69,8 +71,8 @@ class ApiType(Enum):
             )
 
 
-api_key_to_header = (
-    lambda api, key: {"Authorization": f"Bearer {key}"}
+api_key_to_header = lambda api, key: (
+    {"Authorization": f"Bearer {key}"}
     if api in (ApiType.OPEN_AI, ApiType.AZURE_AD)
     else {"api-key": f"{key}"}
 )
@@ -244,7 +246,9 @@ class APIRequestor:
     ):
         self.base_url = base_url or openai.base_url
         self.api_key = key or openai.api_key
-        self.api_type = ApiType.from_str(api_type) if api_type else ApiType.from_str("openai")
+        self.api_type = (
+            ApiType.from_str(api_type) if api_type else ApiType.from_str("openai")
+        )
         self.api_version = api_version or openai.api_version
         self.organization = organization or openai.organization
 
@@ -354,42 +358,49 @@ class APIRequestor:
         request_id: Optional[str] = None,
         request_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     ) -> Tuple[Union[OpenAIResponse, AsyncGenerator[OpenAIResponse, None]], bool, str]:
-        ctx = aiohttp_session()
-        session = await ctx.__aenter__()
-        try:
-            result = await self.arequest_raw(
-                method.lower(),
-                url,
-                session,
-                params=params,
-                supplied_headers=headers,
-                files=files,
-                request_id=request_id,
-                request_timeout=request_timeout,
-            )
-            resp, got_stream = await self._interpret_async_response(result, stream)
-        except Exception:
-            await ctx.__aexit__(None, None, None)
-            raise
-        if got_stream:
+        with span(
+            label("http.arequest", method=method, url=url, stream=stream), color="red"
+        ):
+            ctx = aiohttp_session()
+            session = await ctx.__aenter__()
+            try:
+                result = await self.arequest_raw(
+                    method.lower(),
+                    url,
+                    session,
+                    params=params,
+                    supplied_headers=headers,
+                    files=files,
+                    request_id=request_id,
+                    request_timeout=request_timeout,
+                )
+                resp, got_stream = await self._interpret_async_response(result, stream)
+            except Exception:
+                await ctx.__aexit__(None, None, None)
+                raise
+            if got_stream:
 
-            async def wrap_resp():
-                assert isinstance(resp, AsyncGenerator)
-                try:
-                    async for r in resp:
-                        yield r
-                finally:
-                    await ctx.__aexit__(None, None, None)
+                async def wrap_resp():
+                    assert isinstance(resp, AsyncGenerator)
+                    try:
+                        async for r in resp:
+                            yield r
+                    finally:
+                        await ctx.__aexit__(None, None, None)
 
-            return wrap_resp(), got_stream, self.api_key
-        else:
-            await ctx.__aexit__(None, None, None)
-            return resp, got_stream, self.api_key
+                return wrap_resp(), got_stream, self.api_key
+            else:
+                await ctx.__aexit__(None, None, None)
+                return resp, got_stream, self.api_key
 
-    def request_headers(self, method: str, extra, request_id: Optional[str]) -> Dict[str, str]:
+    def request_headers(
+        self, method: str, extra, request_id: Optional[str]
+    ) -> Dict[str, str]:
         user_agent = "LLM/v1 PythonBindings/%s" % (version.VERSION,)
 
-        uname_without_node = " ".join(v for k, v in platform.uname()._asdict().items() if k != "node")
+        uname_without_node = " ".join(
+            v for k, v in platform.uname()._asdict().items() if k != "node"
+        )
         ua = {
             "bindings_version": version.VERSION,
             "httplib": "requests",
@@ -418,7 +429,9 @@ class APIRequestor:
 
         return headers
 
-    def _validate_headers(self, supplied_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    def _validate_headers(
+        self, supplied_headers: Optional[Dict[str, str]]
+    ) -> Dict[str, str]:
         headers: Dict[str, str] = {}
         if supplied_headers is None:
             return headers
@@ -453,7 +466,9 @@ class APIRequestor:
         data = None
         if method == "get" or method == "delete":
             if params:
-                encoded_params = urlencode([(k, v) for k, v in params.items() if v is not None])
+                encoded_params = urlencode(
+                    [(k, v) for k, v in params.items() if v is not None]
+                )
                 abs_url = _build_api_url(abs_url, encoded_params)
         elif method in {"post", "put"}:
             if params and files:
@@ -486,12 +501,17 @@ class APIRequestor:
         request_id: Optional[str] = None,
         request_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     ) -> requests.Response:
-        abs_url, headers, data = self._prepare_request_raw(url, supplied_headers, method, params, files, request_id)
+        abs_url, headers, data = self._prepare_request_raw(
+            url, supplied_headers, method, params, files, request_id
+        )
 
         if not hasattr(_thread_context, "session"):
             _thread_context.session = _make_session()
             _thread_context.session_create_time = time.time()
-        elif time.time() - getattr(_thread_context, "session_create_time", 0) >= MAX_SESSION_LIFETIME_SECS:
+        elif (
+            time.time() - getattr(_thread_context, "session_create_time", 0)
+            >= MAX_SESSION_LIFETIME_SECS
+        ):
             _thread_context.session.close()
             _thread_context.session = _make_session()
             _thread_context.session_create_time = time.time()
@@ -509,7 +529,9 @@ class APIRequestor:
         except requests.exceptions.Timeout as e:
             raise openai.APITimeoutError("Request timed out: {}".format(e)) from e
         except requests.exceptions.RequestException as e:
-            raise openai.APIConnectionError(message="Error communicating with LLM: {}".format(e), request=None) from e
+            raise openai.APIConnectionError(
+                message="Error communicating with LLM: {}".format(e), request=None
+            ) from e
         # log_debug(
         #     "LLM API response",
         #     path=abs_url,
@@ -531,35 +553,40 @@ class APIRequestor:
         request_id: Optional[str] = None,
         request_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     ) -> aiohttp.ClientResponse:
-        abs_url, headers, data = self._prepare_request_raw(url, supplied_headers, method, params, files, request_id)
+        abs_url, headers, data = self._prepare_request_raw(
+            url, supplied_headers, method, params, files, request_id
+        )
 
-        if isinstance(request_timeout, tuple):
-            timeout = aiohttp.ClientTimeout(
-                connect=request_timeout[0],
-                total=request_timeout[1],
-            )
-        else:
-            timeout = aiohttp.ClientTimeout(total=request_timeout or TIMEOUT_SECS)
+        with span(label("http.arequest_raw", method=method, url=abs_url), color="red"):
+            if isinstance(request_timeout, tuple):
+                timeout = aiohttp.ClientTimeout(
+                    connect=request_timeout[0],
+                    total=request_timeout[1],
+                )
+            else:
+                timeout = aiohttp.ClientTimeout(total=request_timeout or TIMEOUT_SECS)
 
-        if files:
-            # TODO: Use `aiohttp.MultipartWriter` to create the multipart form data here.
-            # For now we use the private `requests` method that is known to have worked so far.
-            data, content_type = requests.models.RequestEncodingMixin._encode_files(files, data)  # type: ignore
-            headers["Content-Type"] = content_type
-        request_kwargs = {
-            "method": method,
-            "url": abs_url,
-            "headers": headers,
-            "data": data,
-            "timeout": timeout,
-        }
-        try:
-            result = await session.request(**request_kwargs)
-            return result
-        except (aiohttp.ServerTimeoutError, asyncio.TimeoutError) as e:
-            raise openai.APITimeoutError("Request timed out") from e
-        except aiohttp.ClientError as e:
-            raise openai.APIConnectionError(message="Error communicating with LLM", request=None) from e
+            if files:
+                # TODO: Use `aiohttp.MultipartWriter` to create the multipart form data here.
+                # For now we use the private `requests` method that is known to have worked so far.
+                data, content_type = requests.models.RequestEncodingMixin._encode_files(files, data)  # type: ignore
+                headers["Content-Type"] = content_type
+            request_kwargs = {
+                "method": method,
+                "url": abs_url,
+                "headers": headers,
+                "data": data,
+                "timeout": timeout,
+            }
+            try:
+                result = await session.request(**request_kwargs)
+                return result
+            except (aiohttp.ServerTimeoutError, asyncio.TimeoutError) as e:
+                raise openai.APITimeoutError("Request timed out") from e
+            except aiohttp.ClientError as e:
+                raise openai.APIConnectionError(
+                    message="Error communicating with LLM", request=None
+                ) from e
 
     def _interpret_response(
         self, result: requests.Response, stream: bool
@@ -571,8 +598,9 @@ class APIRequestor:
     ) -> Tuple[Union[OpenAIResponse, AsyncGenerator[OpenAIResponse, None]], bool]:
         """Returns the response(s) and a bool indicating whether it is a stream."""
 
-    def _interpret_response_line(self, rbody: str, rcode: int, rheaders, stream: bool) -> OpenAIResponse:
-        ...
+    def _interpret_response_line(
+        self, rbody: str, rcode: int, rheaders, stream: bool
+    ) -> OpenAIResponse: ...
 
 
 @asynccontextmanager

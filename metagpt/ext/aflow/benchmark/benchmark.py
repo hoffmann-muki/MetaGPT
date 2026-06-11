@@ -12,6 +12,7 @@ from tqdm.asyncio import tqdm_asyncio
 
 from metagpt.logs import logger
 from metagpt.utils.common import write_json_file
+from metagpt._profiling import label, span
 
 
 class BaseBenchmark(ABC):
@@ -77,28 +78,50 @@ class BaseBenchmark(ABC):
         pass
 
     @abstractmethod
-    def calculate_score(self, expected_output: Any, prediction: Any) -> Tuple[float, Any]:
+    def calculate_score(
+        self, expected_output: Any, prediction: Any
+    ) -> Tuple[float, Any]:
         pass
 
     @abstractmethod
     def get_result_columns(self) -> List[str]:
         pass
 
-    async def evaluate_all_problems(self, data: List[dict], graph: Callable, max_concurrent_tasks: int = 50):
-        semaphore = asyncio.Semaphore(max_concurrent_tasks)
+    async def evaluate_all_problems(
+        self, data: List[dict], graph: Callable, max_concurrent_tasks: int = 50
+    ):
+        with span(
+            label(
+                "aflow.benchmark_all",
+                dataset=self.name,
+                problems=len(data),
+                concurrency=max_concurrent_tasks,
+            ),
+            color="blue",
+        ):
+            semaphore = asyncio.Semaphore(max_concurrent_tasks)
 
-        async def sem_evaluate(problem):
-            async with semaphore:
-                return await self.evaluate_problem(problem, graph)
+            async def sem_evaluate(problem):
+                async with semaphore:
+                    return await self.evaluate_problem(problem, graph)
 
-        tasks = [sem_evaluate(problem) for problem in data]
-        return await tqdm_asyncio.gather(*tasks, desc=f"Evaluating {self.name} problems", total=len(data))
+            tasks = [sem_evaluate(problem) for problem in data]
+            return await tqdm_asyncio.gather(
+                *tasks, desc=f"Evaluating {self.name} problems", total=len(data)
+            )
 
-    async def run_evaluation(self, graph: Callable, va_list: List[int], max_concurrent_tasks: int = 50):
-        data = await self.load_data(va_list)
-        results = await self.evaluate_all_problems(data, graph, max_concurrent_tasks)
-        columns = self.get_result_columns()
-        average_score, average_cost, total_cost = self.save_results_to_csv(results, columns)
-        logger.info(f"Average score on {self.name} dataset: {average_score:.5f}")
-        logger.info(f"Total Cost: {total_cost:.5f}")
-        return average_score, average_cost, total_cost
+    async def run_evaluation(
+        self, graph: Callable, va_list: List[int], max_concurrent_tasks: int = 50
+    ):
+        with span(label("aflow.benchmark", dataset=self.name), color="blue"):
+            data = await self.load_data(va_list)
+            results = await self.evaluate_all_problems(
+                data, graph, max_concurrent_tasks
+            )
+            columns = self.get_result_columns()
+            average_score, average_cost, total_cost = self.save_results_to_csv(
+                results, columns
+            )
+            logger.info(f"Average score on {self.name} dataset: {average_score:.5f}")
+            logger.info(f"Total Cost: {total_cost:.5f}")
+            return average_score, average_cost, total_cost

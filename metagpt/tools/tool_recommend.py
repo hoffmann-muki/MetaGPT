@@ -16,6 +16,7 @@ from metagpt.tools import TOOL_REGISTRY
 from metagpt.tools.tool_data_type import Tool
 from metagpt.tools.tool_registry import validate_tool_names
 from metagpt.utils.common import CodeParser
+from metagpt._profiling import label, span
 from metagpt.utils.repair_llm_raw_output import RepairType, repair_llm_raw_output
 
 TOOL_INFO_PROMPT = """
@@ -90,84 +91,134 @@ class ToolRecommender(BaseModel):
             list[Tool]: A list of recommended tools.
         """
 
-        if not self.tools:
-            return []
+        with span(
+            label(
+                "tools.recommend",
+                recommender=type(self).__name__,
+                tools=len(self.tools),
+                recall_topk=recall_topk,
+                topk=topk,
+            ),
+            color="magenta",
+        ):
+            if not self.tools:
+                return []
 
-        if self.force or (not context and not plan):
-            # directly use what users have specified as result for forced recommendation;
-            # directly use the whole set if there is no useful information
-            return list(self.tools.values())
+            if self.force or (not context and not plan):
+                # directly use what users have specified as result for forced recommendation;
+                # directly use the whole set if there is no useful information
+                return list(self.tools.values())
 
-        recalled_tools = await self.recall_tools(context=context, plan=plan, topk=recall_topk)
-        if not recalled_tools:
-            return []
+            recalled_tools = await self.recall_tools(
+                context=context, plan=plan, topk=recall_topk
+            )
+            if not recalled_tools:
+                return []
 
-        ranked_tools = await self.rank_tools(recalled_tools=recalled_tools, context=context, plan=plan, topk=topk)
+            ranked_tools = await self.rank_tools(
+                recalled_tools=recalled_tools, context=context, plan=plan, topk=topk
+            )
 
-        logger.info(f"Recommended tools: \n{[tool.name for tool in ranked_tools]}")
+            logger.info(f"Recommended tools: \n{[tool.name for tool in ranked_tools]}")
 
-        return ranked_tools
+            return ranked_tools
 
     async def get_recommended_tool_info(self, fixed: list[str] = None, **kwargs) -> str:
         """
         Wrap recommended tools with their info in a string, which can be used directly in a prompt.
         """
-        recommended_tools = await self.recommend_tools(**kwargs)
-        if fixed:
-            recommended_tools.extend([self.tools[tool_name] for tool_name in fixed if tool_name in self.tools])
-        if not recommended_tools:
-            return ""
-        tool_schemas = {tool.name: tool.schemas for tool in recommended_tools}
-        return TOOL_INFO_PROMPT.format(tool_schemas=tool_schemas)
+        with span(
+            label("tools.info", recommender=type(self).__name__), color="magenta"
+        ):
+            recommended_tools = await self.recommend_tools(**kwargs)
+            if fixed:
+                recommended_tools.extend(
+                    [
+                        self.tools[tool_name]
+                        for tool_name in fixed
+                        if tool_name in self.tools
+                    ]
+                )
+            if not recommended_tools:
+                return ""
+            tool_schemas = {tool.name: tool.schemas for tool in recommended_tools}
+            return TOOL_INFO_PROMPT.format(tool_schemas=tool_schemas)
 
-    async def recall_tools(self, context: str = "", plan: Plan = None, topk: int = 20) -> list[Tool]:
+    async def recall_tools(
+        self, context: str = "", plan: Plan = None, topk: int = 20
+    ) -> list[Tool]:
         """
         Retrieves a list of relevant tools from a large pool, based on the given context and plan.
         """
         raise NotImplementedError
 
     async def rank_tools(
-        self, recalled_tools: list[Tool], context: str = "", plan: Plan = None, topk: int = 5
+        self,
+        recalled_tools: list[Tool],
+        context: str = "",
+        plan: Plan = None,
+        topk: int = 5,
     ) -> list[Tool]:
         """
         Default rank methods for a ToolRecommender. Use LLM to rank the recalled tools based on the given context, plan, and topk value.
         """
-        current_task = plan.current_task.instruction if plan else context
+        with span(
+            label(
+                "tools.rank",
+                recommender=type(self).__name__,
+                recalled=len(recalled_tools),
+                topk=topk,
+            ),
+            color="magenta",
+        ):
+            current_task = plan.current_task.instruction if plan else context
 
-        available_tools = {tool.name: tool.schemas["description"] for tool in recalled_tools}
-        prompt = TOOL_RECOMMENDATION_PROMPT.format(
-            current_task=current_task,
-            available_tools=available_tools,
-            topk=topk,
-        )
-        rsp = await LLM().aask(prompt, stream=False)
-
-        # 临时方案，待role zero的版本完成可将本注释内的代码直接替换掉
-        # -------------开始---------------
-        try:
-            ranked_tools = CodeParser.parse_code(block=None, lang="json", text=rsp)
-            ranked_tools = json.loads(
-                repair_llm_raw_output(output=ranked_tools, req_keys=[None], repair_type=RepairType.JSON)
+            available_tools = {
+                tool.name: tool.schemas["description"] for tool in recalled_tools
+            }
+            prompt = TOOL_RECOMMENDATION_PROMPT.format(
+                current_task=current_task,
+                available_tools=available_tools,
+                topk=topk,
             )
-        except json.JSONDecodeError:
-            ranked_tools = await LLM().aask(msg=JSON_REPAIR_PROMPT.format(json_data=rsp))
-            ranked_tools = json.loads(CodeParser.parse_code(block=None, lang="json", text=ranked_tools))
-        except Exception:
-            tb = traceback.format_exc()
-            print(tb)
+            rsp = await LLM().aask(prompt, stream=False)
 
-        # 为了对LLM不按格式生成进行容错
-        if isinstance(ranked_tools, dict):
-            ranked_tools = list(ranked_tools.values())[0]
-        # -------------结束---------------
+            # 临时方案，待role zero的版本完成可将本注释内的代码直接替换掉
+            # -------------开始---------------
+            try:
+                ranked_tools = CodeParser.parse_code(block=None, lang="json", text=rsp)
+                ranked_tools = json.loads(
+                    repair_llm_raw_output(
+                        output=ranked_tools,
+                        req_keys=[None],
+                        repair_type=RepairType.JSON,
+                    )
+                )
+            except json.JSONDecodeError:
+                ranked_tools = await LLM().aask(
+                    msg=JSON_REPAIR_PROMPT.format(json_data=rsp)
+                )
+                ranked_tools = json.loads(
+                    CodeParser.parse_code(block=None, lang="json", text=ranked_tools)
+                )
+            except Exception:
+                tb = traceback.format_exc()
+                print(tb)
 
-        if not isinstance(ranked_tools, list):
-            logger.warning(f"Invalid rank result: {ranked_tools}, will use the recalled tools instead.")
-            ranked_tools = list(available_tools.keys())
+            # 为了对LLM不按格式生成进行容错
+            if isinstance(ranked_tools, dict):
+                ranked_tools = list(ranked_tools.values())[0]
+            # -------------结束---------------
 
-        valid_tools = validate_tool_names(ranked_tools)
+            if not isinstance(ranked_tools, list):
+                logger.warning(
+                    f"Invalid rank result: {ranked_tools}, will use the recalled tools instead."
+                )
+                ranked_tools = list(available_tools.keys())
 
-        return list(valid_tools.values())[:topk]
+            valid_tools = validate_tool_names(ranked_tools)
+
+            return list(valid_tools.values())[:topk]
 
 
 class TypeMatchToolRecommender(ToolRecommender):
@@ -177,19 +228,24 @@ class TypeMatchToolRecommender(ToolRecommender):
     2. Rank: LLM rank, the same as the default ToolRecommender.
     """
 
-    async def recall_tools(self, context: str = "", plan: Plan = None, topk: int = 20) -> list[Tool]:
-        if not plan:
-            return list(self.tools.values())[:topk]
+    async def recall_tools(
+        self, context: str = "", plan: Plan = None, topk: int = 20
+    ) -> list[Tool]:
+        with span(label("tools.recall_type_match", topk=topk), color="magenta"):
+            if not plan:
+                return list(self.tools.values())[:topk]
 
-        # find tools based on exact match between task type and tool tag
-        task_type = plan.current_task.task_type
-        candidate_tools = TOOL_REGISTRY.get_tools_by_tag(task_type)
-        candidate_tool_names = set(self.tools.keys()) & candidate_tools.keys()
-        recalled_tools = [candidate_tools[tool_name] for tool_name in candidate_tool_names][:topk]
+            # find tools based on exact match between task type and tool tag
+            task_type = plan.current_task.task_type
+            candidate_tools = TOOL_REGISTRY.get_tools_by_tag(task_type)
+            candidate_tool_names = set(self.tools.keys()) & candidate_tools.keys()
+            recalled_tools = [
+                candidate_tools[tool_name] for tool_name in candidate_tool_names
+            ][:topk]
 
-        logger.info(f"Recalled tools: \n{[tool.name for tool in recalled_tools]}")
+            logger.info(f"Recalled tools: \n{[tool.name for tool in recalled_tools]}")
 
-        return recalled_tools
+            return recalled_tools
 
 
 class BM25ToolRecommender(ToolRecommender):
@@ -206,26 +262,35 @@ class BM25ToolRecommender(ToolRecommender):
         self._init_corpus()
 
     def _init_corpus(self):
-        corpus = [f"{tool.name} {tool.tags}: {tool.schemas['description']}" for tool in self.tools.values()]
+        corpus = [
+            f"{tool.name} {tool.tags}: {tool.schemas['description']}"
+            for tool in self.tools.values()
+        ]
         tokenized_corpus = [self._tokenize(doc) for doc in corpus]
         self.bm25 = BM25Okapi(tokenized_corpus)
 
     def _tokenize(self, text):
         return text.split()  # FIXME: needs more sophisticated tokenization
 
-    async def recall_tools(self, context: str = "", plan: Plan = None, topk: int = 20) -> list[Tool]:
-        query = plan.current_task.instruction if plan else context
+    async def recall_tools(
+        self, context: str = "", plan: Plan = None, topk: int = 20
+    ) -> list[Tool]:
+        with span(
+            label("tools.recall_bm25", topk=topk, tools=len(self.tools)),
+            color="magenta",
+        ):
+            query = plan.current_task.instruction if plan else context
 
-        query_tokens = self._tokenize(query)
-        doc_scores = self.bm25.get_scores(query_tokens)
-        top_indexes = np.argsort(doc_scores)[::-1][:topk]
-        recalled_tools = [list(self.tools.values())[index] for index in top_indexes]
+            query_tokens = self._tokenize(query)
+            doc_scores = self.bm25.get_scores(query_tokens)
+            top_indexes = np.argsort(doc_scores)[::-1][:topk]
+            recalled_tools = [list(self.tools.values())[index] for index in top_indexes]
 
-        logger.info(
-            f"Recalled tools: \n{[tool.name for tool in recalled_tools]}; Scores: {[np.round(doc_scores[index], 4) for index in top_indexes]}"
-        )
+            logger.info(
+                f"Recalled tools: \n{[tool.name for tool in recalled_tools]}; Scores: {[np.round(doc_scores[index], 4) for index in top_indexes]}"
+            )
 
-        return recalled_tools
+            return recalled_tools
 
 
 class EmbeddingToolRecommender(ToolRecommender):
@@ -239,5 +304,7 @@ class EmbeddingToolRecommender(ToolRecommender):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    async def recall_tools(self, context: str = "", plan: Plan = None, topk: int = 20) -> list[Tool]:
+    async def recall_tools(
+        self, context: str = "", plan: Plan = None, topk: int = 20
+    ) -> list[Tool]:
         pass

@@ -13,6 +13,7 @@ from metagpt.provider.base_llm import BaseLLM
 from metagpt.provider.general_api_requestor import GeneralAPIRequestor, OpenAIResponse
 from metagpt.provider.llm_provider_registry import register_provider
 from metagpt.utils.cost_manager import TokenCostManager
+from metagpt._profiling import label, span
 
 
 class OllamaMessageAPI(Enum):
@@ -64,7 +65,9 @@ class OllamaMessageMeta(type):
         for base in bases:
             if issubclass(base, OllamaMessageBase):
                 api_type = attrs["api_type"]
-                assert api_type not in OllamaMessageMeta.registed_message, "api_type already exist"
+                assert (
+                    api_type not in OllamaMessageMeta.registed_message
+                ), "api_type already exist"
                 assert isinstance(api_type, OllamaMessageAPI), "api_type not support"
                 OllamaMessageMeta.registed_message[api_type] = cls
 
@@ -132,7 +135,11 @@ class OllamaMessageGenerate(OllamaMessageChat, metaclass=OllamaMessageMeta):
         else:
             prompts.append(content)
         if len(images) > 0:
-            sends = {"model": self.model, "prompt": "\n".join(prompts), "images": images}
+            sends = {
+                "model": self.model,
+                "prompt": "\n".join(prompts),
+                "images": images,
+            }
         else:
             sends = {"model": self.model, "prompt": "\n".join(prompts)}
         sends.update(self.additional_kwargs)
@@ -217,42 +224,68 @@ class OllamaLLM(BaseLLM):
         self.ollama_message = ollama_message(model=self.model, **self._llama_api_kwargs)
 
     def get_usage(self, resp: dict) -> dict:
-        return {"prompt_tokens": resp.get("prompt_eval_count", 0), "completion_tokens": resp.get("eval_count", 0)}
+        return {
+            "prompt_tokens": resp.get("prompt_eval_count", 0),
+            "completion_tokens": resp.get("eval_count", 0),
+        }
 
-    async def _achat_completion(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT) -> dict:
-        resp, _, _ = await self.client.arequest(
-            method=self.http_method,
-            url=self.ollama_message.api_suffix,
-            params=self.ollama_message.apply(messages=messages),
-            request_timeout=self.get_timeout(timeout),
-        )
-        if isinstance(resp, AsyncGenerator):
-            return await self._processing_openai_response_async_generator(resp)
-        elif isinstance(resp, OpenAIResponse):
-            return self._processing_openai_response(resp)
-        else:
-            raise ValueError
+    async def _achat_completion(
+        self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT
+    ) -> dict:
+        with span(
+            label(
+                "ollama.request",
+                model=self.model,
+                endpoint=self.ollama_message.api_suffix,
+                messages=len(messages),
+            ),
+            color="red",
+        ):
+            resp, _, _ = await self.client.arequest(
+                method=self.http_method,
+                url=self.ollama_message.api_suffix,
+                params=self.ollama_message.apply(messages=messages),
+                request_timeout=self.get_timeout(timeout),
+            )
+            if isinstance(resp, AsyncGenerator):
+                return await self._processing_openai_response_async_generator(resp)
+            elif isinstance(resp, OpenAIResponse):
+                return self._processing_openai_response(resp)
+            else:
+                raise ValueError
 
     def get_choice_text(self, rsp):
         return self.ollama_message.get_choice(rsp)
 
-    async def acompletion(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> dict:
+    async def acompletion(
+        self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT
+    ) -> dict:
         return await self._achat_completion(messages, timeout=self.get_timeout(timeout))
 
-    async def _achat_completion_stream(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT) -> str:
-        resp, _, _ = await self.client.arequest(
-            method=self.http_method,
-            url=self.ollama_message.api_suffix,
-            params=self.ollama_message.apply(messages=messages),
-            request_timeout=self.get_timeout(timeout),
-            stream=True,
-        )
-        if isinstance(resp, AsyncGenerator):
-            return await self._processing_openai_response_async_generator(resp)
-        elif isinstance(resp, OpenAIResponse):
-            return self._processing_openai_response(resp)
-        else:
-            raise ValueError
+    async def _achat_completion_stream(
+        self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT
+    ) -> str:
+        with span(
+            label(
+                "ollama.stream_request",
+                model=self.model,
+                endpoint=self.ollama_message.api_suffix,
+            ),
+            color="red",
+        ):
+            resp, _, _ = await self.client.arequest(
+                method=self.http_method,
+                url=self.ollama_message.api_suffix,
+                params=self.ollama_message.apply(messages=messages),
+                request_timeout=self.get_timeout(timeout),
+                stream=True,
+            )
+            if isinstance(resp, AsyncGenerator):
+                return await self._processing_openai_response_async_generator(resp)
+            elif isinstance(resp, OpenAIResponse):
+                return self._processing_openai_response(resp)
+            else:
+                raise ValueError
 
     def _processing_openai_response(self, openai_resp: OpenAIResponse):
         resp = self.ollama_message.decode(openai_resp)
@@ -260,24 +293,27 @@ class OllamaLLM(BaseLLM):
         self._update_costs(usage)
         return resp
 
-    async def _processing_openai_response_async_generator(self, ag_openai_resp: AsyncGenerator[OpenAIResponse, None]):
-        collected_content = []
-        usage = {}
-        async for raw_chunk in ag_openai_resp:
-            chunk = self.ollama_message.decode(raw_chunk)
+    async def _processing_openai_response_async_generator(
+        self, ag_openai_resp: AsyncGenerator[OpenAIResponse, None]
+    ):
+        with span(label("ollama.stream_decode", model=self.model), color="red"):
+            collected_content = []
+            usage = {}
+            async for raw_chunk in ag_openai_resp:
+                chunk = self.ollama_message.decode(raw_chunk)
 
-            if not chunk.get("done", False):
-                content = self.ollama_message.get_choice(chunk)
-                collected_content.append(content)
-                log_llm_stream(content)
-            else:
-                # stream finished
-                usage = self.get_usage(chunk)
-        log_llm_stream("\n")
+                if not chunk.get("done", False):
+                    content = self.ollama_message.get_choice(chunk)
+                    collected_content.append(content)
+                    log_llm_stream(content)
+                else:
+                    # stream finished
+                    usage = self.get_usage(chunk)
+            log_llm_stream("\n")
 
-        self._update_costs(usage)
-        full_content = "".join(collected_content)
-        return full_content
+            self._update_costs(usage)
+            full_content = "".join(collected_content)
+            return full_content
 
 
 @register_provider(LLMType.OLLAMA_GENERATE)
@@ -305,16 +341,29 @@ class OllamaEmbeddings(OllamaLLM):
     def _llama_embedding_key(self) -> str:
         return "embedding"
 
-    async def _achat_completion(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT) -> dict:
-        resp, _, _ = await self.client.arequest(
-            method=self.http_method,
-            url=self.ollama_message.api_suffix,
-            params=self.ollama_message.apply(messages=messages),
-            request_timeout=self.get_timeout(timeout),
-        )
-        return self.ollama_message.decode(resp)[self._llama_embedding_key]
+    async def _achat_completion(
+        self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT
+    ) -> dict:
+        with span(
+            label(
+                "ollama.embedding_request",
+                model=self.model,
+                endpoint=self.ollama_message.api_suffix,
+                messages=len(messages),
+            ),
+            color="red",
+        ):
+            resp, _, _ = await self.client.arequest(
+                method=self.http_method,
+                url=self.ollama_message.api_suffix,
+                params=self.ollama_message.apply(messages=messages),
+                request_timeout=self.get_timeout(timeout),
+            )
+            return self.ollama_message.decode(resp)[self._llama_embedding_key]
 
-    async def _achat_completion_stream(self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT) -> str:
+    async def _achat_completion_stream(
+        self, messages: list[dict], timeout: int = USE_CONFIG_TIMEOUT
+    ) -> str:
         return await self._achat_completion(messages, timeout=self.get_timeout(timeout))
 
     def get_choice_text(self, rsp):

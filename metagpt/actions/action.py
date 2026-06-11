@@ -24,6 +24,7 @@ from metagpt.schema import (
     SerializationMixin,
     TestingContext,
 )
+from metagpt._profiling import label, span
 
 
 class Action(SerializationMixin, ContextMixin, BaseModel):
@@ -31,7 +32,14 @@ class Action(SerializationMixin, ContextMixin, BaseModel):
 
     name: str = ""
     i_context: Union[
-        dict, CodingContext, CodeSummarizeContext, TestingContext, RunCodeContext, CodePlanAndChangeContext, str, None
+        dict,
+        CodingContext,
+        CodeSummarizeContext,
+        TestingContext,
+        RunCodeContext,
+        CodePlanAndChangeContext,
+        str,
+        None,
     ] = ""
     prefix: str = ""  # aask*时会加上prefix，作为system_message
     desc: str = ""  # for skill manager
@@ -79,7 +87,9 @@ class Action(SerializationMixin, ContextMixin, BaseModel):
         if "instruction" in values:
             name = values["name"]
             i = values.pop("instruction")
-            values["node"] = ActionNode(key=name, expected_type=str, instruction=i, example="", schema="raw")
+            values["node"] = ActionNode(
+                key=name, expected_type=str, instruction=i, example="", schema="raw"
+            )
         return values
 
     def set_prefix(self, prefix):
@@ -98,20 +108,33 @@ class Action(SerializationMixin, ContextMixin, BaseModel):
 
     async def _aask(self, prompt: str, system_msgs: Optional[list[str]] = None) -> str:
         """Append default prefix"""
-        return await self.llm.aask(prompt, system_msgs)
+        with span(
+            label("action.aask", action=self.name, prompt_chars=len(prompt)),
+            color="orange",
+        ):
+            return await self.llm.aask(prompt, system_msgs)
 
     async def _run_action_node(self, *args, **kwargs):
         """Run action node"""
-        msgs = args[0]
-        context = "## History Messages\n"
-        context += "\n".join([f"{idx}: {i}" for idx, i in enumerate(reversed(msgs))])
-        return await self.node.fill(req=context, llm=self.llm)
+        with span(label("action.node", action=self.name), color="orange"):
+            msgs = args[0]
+            context = "## History Messages\n"
+            context += "\n".join(
+                [f"{idx}: {i}" for idx, i in enumerate(reversed(msgs))]
+            )
+            return await self.node.fill(req=context, llm=self.llm)
 
     async def run(self, *args, **kwargs):
         """Run action"""
-        if self.node:
-            return await self._run_action_node(*args, **kwargs)
-        raise NotImplementedError("The run method should be implemented in a subclass.")
+        with span(
+            label("action.run", action=self.name, cls=type(self).__name__),
+            color="orange",
+        ):
+            if self.node:
+                return await self._run_action_node(*args, **kwargs)
+            raise NotImplementedError(
+                "The run method should be implemented in a subclass."
+            )
 
     def override_context(self):
         """Set `private_context` and `context` to the same `Context` object."""

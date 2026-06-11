@@ -24,6 +24,7 @@ from metagpt.memory import Memory
 from metagpt.schema import Message
 from metagpt.utils.common import get_function_schema, is_coroutine_func, is_send_to
 from metagpt.utils.git_repository import GitRepository
+from metagpt._profiling import label, span
 
 
 class EnvType(Enum):
@@ -55,8 +56,12 @@ class ExtEnv(BaseEnvironment, BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    action_space: spaces.Space[ActType] = Field(default_factory=spaces.Space, exclude=True)
-    observation_space: spaces.Space[ObsType] = Field(default_factory=spaces.Space, exclude=True)
+    action_space: spaces.Space[ActType] = Field(
+        default_factory=spaces.Space, exclude=True
+    )
+    observation_space: spaces.Space[ObsType] = Field(
+        default_factory=spaces.Space, exclude=True
+    )
 
     def _check_api_exist(self, rw_api: Optional[str] = None):
         if not rw_api:
@@ -80,7 +85,9 @@ class ExtEnv(BaseEnvironment, BaseModel):
             else:
                 res = env_read_api(self)
         elif isinstance(env_action, EnvAPIAbstract):
-            env_read_api = env_read_api_registry.get(api_name=env_action.api_name)["func"]
+            env_read_api = env_read_api_registry.get(api_name=env_action.api_name)[
+                "func"
+            ]
             self._check_api_exist(env_read_api)
             if is_coroutine_func(env_read_api):
                 res = await env_read_api(self, *env_action.args, **env_action.kwargs)
@@ -88,7 +95,9 @@ class ExtEnv(BaseEnvironment, BaseModel):
                 res = env_read_api(self, *env_action.args, **env_action.kwargs)
         return res
 
-    async def write_thru_api(self, env_action: Union[str, Message, EnvAPIAbstract, list[EnvAPIAbstract]]):
+    async def write_thru_api(
+        self, env_action: Union[str, Message, EnvAPIAbstract, list[EnvAPIAbstract]]
+    ):
         """execute through particular api of ExtEnv"""
         res = None
         if isinstance(env_action, Message):
@@ -117,7 +126,9 @@ class ExtEnv(BaseEnvironment, BaseModel):
         """Implement this if you want to get partial observation from the env"""
 
     @abstractmethod
-    def step(self, action: BaseEnvAction) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+    def step(
+        self, action: BaseEnvAction
+    ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """Implement this to feed a action and then get new observation from the env"""
 
 
@@ -129,7 +140,9 @@ class Environment(ExtEnv):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     desc: str = Field(default="")  # 环境描述
-    roles: dict[str, SerializeAsAny[BaseRole]] = Field(default_factory=dict, validate_default=True)
+    roles: dict[str, SerializeAsAny[BaseRole]] = Field(
+        default_factory=dict, validate_default=True
+    )
     member_addrs: Dict[BaseRole, Set] = Field(default_factory=dict, exclude=True)
     history: Memory = Field(default_factory=Memory)  # For debug
     context: Context = Field(default_factory=Context, exclude=True)
@@ -145,7 +158,9 @@ class Environment(ExtEnv):
     def observe(self, obs_params: Optional[BaseEnvObsParams] = None) -> Any:
         pass
 
-    def step(self, action: BaseEnvAction) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+    def step(
+        self, action: BaseEnvAction
+    ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         pass
 
     @model_validator(mode="after")
@@ -181,34 +196,52 @@ class Environment(ExtEnv):
         route the message to the message recipient is a problem addressed by the transport framework designed
         in RFC 113.
         """
-        logger.debug(f"publish_message: {message.dump()}")
-        found = False
-        # According to the routing feature plan in Chapter 2.2.3.2 of RFC 113
-        for role, addrs in self.member_addrs.items():
-            if is_send_to(message, addrs):
-                role.put_message(message)
-                found = True
-        if not found:
-            logger.warning(f"Message no recipients: {message.dump()}")
-        self.history.add(message)  # For debug
+        with span(
+            label(
+                "env.publish_message",
+                env=type(self).__name__,
+                cause_by=getattr(message.cause_by, "__name__", message.cause_by),
+                send_to=",".join(message.send_to),
+            ),
+            color="gray",
+        ):
+            logger.debug(f"publish_message: {message.dump()}")
+            found = False
+            # According to the routing feature plan in Chapter 2.2.3.2 of RFC 113
+            for role, addrs in self.member_addrs.items():
+                if is_send_to(message, addrs):
+                    role.put_message(message)
+                    found = True
+            if not found:
+                logger.warning(f"Message no recipients: {message.dump()}")
+            self.history.add(message)  # For debug
 
-        return True
+            return True
 
     async def run(self, k=1):
         """处理一次所有信息的运行
         Process all Role runs at once
         """
-        for _ in range(k):
-            futures = []
-            for role in self.roles.values():
-                if role.is_idle:
-                    continue
-                future = role.run()
-                futures.append(future)
+        with span(label("env.run", env=type(self).__name__, steps=k), color="gray"):
+            for step in range(k):
+                futures = []
+                active_roles = []
+                for role in self.roles.values():
+                    if role.is_idle:
+                        continue
+                    active_roles.append(role.name)
+                    future = role.run()
+                    futures.append(future)
 
-            if futures:
-                await asyncio.gather(*futures)
-            logger.debug(f"is idle: {self.is_idle}")
+                if futures:
+                    with span(
+                        label(
+                            "env.run_roles", step=step + 1, roles=",".join(active_roles)
+                        ),
+                        color="gray",
+                    ):
+                        await asyncio.gather(*futures)
+                logger.debug(f"is idle: {self.is_idle}")
 
     def get_roles(self) -> dict[str, BaseRole]:
         """获得环境内的所有角色

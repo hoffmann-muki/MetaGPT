@@ -1,4 +1,5 @@
 """Setup script for MetaGPT."""
+
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,7 @@ extras_require = {
     "selenium": ["selenium>4", "webdriver_manager", "beautifulsoup4"],
     "search-google": ["google-api-python-client==2.94.0"],
     "search-ddg": ["duckduckgo-search~=4.1.1"],
+    "profiling": ["nvtx>=0.2.10"],
     # "ocr": ["paddlepaddle==2.4.2", "paddleocr~=2.7.3", "tabulate==0.9.0"],
     "rag": [
         "llama-index-core==0.10.15",
@@ -69,7 +71,9 @@ extras_require["test"] = [
 extras_require["pyppeteer"] = [
     "pyppeteer>=1.0.2"
 ]  # pyppeteer is unmaintained and there are conflicts with dependencies
-extras_require["dev"] = (["pylint~=3.0.3", "black~=23.3.0", "isort~=5.12.0", "pre-commit~=3.6.0"],)
+extras_require["dev"] = (
+    ["pylint~=3.0.3", "black~=23.3.0", "isort~=5.12.0", "pre-commit~=3.6.0"],
+)
 extras_require["android_assistant"] = [
     "pyshine==0.0.9",
     "opencv-python==4.6.0.66",

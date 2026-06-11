@@ -46,6 +46,7 @@ from metagpt.schema import (
 )
 from metagpt.strategy.planner import Planner
 from metagpt.utils.common import any_to_name, any_to_str, role_raise_decorator
+from metagpt._profiling import label, span
 from metagpt.utils.repair_llm_raw_output import extract_state_value_from_output
 
 PREFIX_TEMPLATE = """You are a {profile}, named {name}, your goal is {goal}. """
@@ -103,7 +104,9 @@ class RoleContext(BaseModel):
     memory: Memory = Field(default_factory=Memory)
     # long_term_memory: LongTermMemory = Field(default_factory=LongTermMemory)
     working_memory: Memory = Field(default_factory=Memory)
-    state: int = Field(default=-1)  # -1 indicates initial or termination state where todo is None
+    state: int = Field(
+        default=-1
+    )  # -1 indicates initial or termination state where todo is None
     todo: Action = Field(default=None, exclude=True)
     watch: set[str] = Field(default_factory=set)
     news: list[Type[Message]] = Field(default=[], exclude=True)  # TODO not used
@@ -153,8 +156,12 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
 
     # builtin variables
     recovered: bool = False  # to tag if a recovered role
-    latest_observed_msg: Optional[Message] = None  # record the latest observed message when interrupted
-    observe_all_msg_from_buffer: bool = False  # whether to save all msgs from buffer to memory for role's awareness
+    latest_observed_msg: Optional[Message] = (
+        None  # record the latest observed message when interrupted
+    )
+    observe_all_msg_from_buffer: bool = (
+        False  # whether to save all msgs from buffer to memory for role's awareness
+    )
 
     __hash__ = object.__hash__  # support Role as hashable type in `Environment.members`
 
@@ -210,7 +217,9 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
     @model_validator(mode="after")
     def check_addresses(self):
         if not self.addresses:
-            self.addresses = {any_to_str(self), self.name} if self.name else {any_to_str(self)}
+            self.addresses = (
+                {any_to_str(self), self.name} if self.name else {any_to_str(self)}
+            )
         return self
 
     def _reset(self):
@@ -258,7 +267,9 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
             self.actions.append(i)
             self.states.append(f"{len(self.actions) - 1}. {action}")
 
-    def _set_react_mode(self, react_mode: str, max_react_loop: int = 1, auto_run: bool = True):
+    def _set_react_mode(
+        self, react_mode: str, max_react_loop: int = 1, auto_run: bool = True
+    ):
         """Set strategy of the Role reacting to observed Message. Variation lies in how
         this Role elects action to perform during the _think stage, especially if it is capable of multiple Actions.
 
@@ -274,12 +285,16 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
                                   Take effect only when react_mode is react, in which we use llm to choose actions, including termination.
                                   Defaults to 1, i.e. _think -> _act (-> return result and end)
         """
-        assert react_mode in RoleReactMode.values(), f"react_mode must be one of {RoleReactMode.values()}"
+        assert (
+            react_mode in RoleReactMode.values()
+        ), f"react_mode must be one of {RoleReactMode.values()}"
         self.rc.react_mode = react_mode
         if react_mode == RoleReactMode.REACT:
             self.rc.max_react_loop = max_react_loop
         elif react_mode == RoleReactMode.PLAN_AND_ACT:
-            self.planner = Planner(goal=self.goal, working_memory=self.rc.working_memory, auto_run=auto_run)
+            self.planner = Planner(
+                goal=self.goal, working_memory=self.rc.working_memory, auto_run=auto_run
+            )
 
     def _watch(self, actions: Iterable[Type[Action]] | Iterable[Action]):
         """Watch Actions of interest. Role will select Messages caused by these Actions from its personal message
@@ -296,7 +311,9 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
         or profile.
         """
         self.addresses = addresses
-        if self.rc.env:  # According to the routing feature plan in Chapter 2.2.3.2 of RFC 113
+        if (
+            self.rc.env
+        ):  # According to the routing feature plan in Chapter 2.2.3.2 of RFC 113
             self.rc.env.set_addresses(self, self.addresses)
 
     def _set_state(self, state: int):
@@ -325,7 +342,9 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
         if self.desc:
             return self.desc
 
-        prefix = PREFIX_TEMPLATE.format(**{"profile": self.profile, "name": self.name, "goal": self.goal})
+        prefix = PREFIX_TEMPLATE.format(
+            **{"profile": self.profile, "name": self.name, "goal": self.goal}
+        )
 
         if self.constraints:
             prefix += CONSTRAINT_TEMPLATE.format(**{"constraints": self.constraints})
@@ -339,92 +358,114 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
 
     async def _think(self) -> bool:
         """Consider what to do and decide on the next course of action. Return false if nothing can be done."""
-        if len(self.actions) == 1:
-            # If there is only one action, then only this one can be performed
-            self._set_state(0)
+        with span(
+            label("role.think", role=self._setting, mode=self.rc.react_mode),
+            color="green",
+        ):
+            if len(self.actions) == 1:
+                # If there is only one action, then only this one can be performed
+                self._set_state(0)
 
+                return True
+
+            if self.recovered and self.rc.state >= 0:
+                self._set_state(self.rc.state)  # action to run from recovered state
+                self.recovered = False  # avoid max_react_loop out of work
+                return True
+
+            if self.rc.react_mode == RoleReactMode.BY_ORDER:
+                if self.rc.max_react_loop != len(self.actions):
+                    self.rc.max_react_loop = len(self.actions)
+                self._set_state(self.rc.state + 1)
+                return self.rc.state >= 0 and self.rc.state < len(self.actions)
+
+            prompt = self._get_prefix()
+            prompt += STATE_TEMPLATE.format(
+                history=self.rc.history,
+                states="\n".join(self.states),
+                n_states=len(self.states) - 1,
+                previous_state=self.rc.state,
+            )
+
+            next_state = await self.llm.aask(prompt)
+            next_state = extract_state_value_from_output(next_state)
+            logger.debug(f"{prompt=}")
+
+            if (not next_state.isdigit() and next_state != "-1") or int(
+                next_state
+            ) not in range(-1, len(self.states)):
+                logger.warning(
+                    f"Invalid answer of state, {next_state=}, will be set to -1"
+                )
+                next_state = -1
+            else:
+                next_state = int(next_state)
+                if next_state == -1:
+                    logger.info(f"End actions with {next_state=}")
+            self._set_state(next_state)
             return True
-
-        if self.recovered and self.rc.state >= 0:
-            self._set_state(self.rc.state)  # action to run from recovered state
-            self.recovered = False  # avoid max_react_loop out of work
-            return True
-
-        if self.rc.react_mode == RoleReactMode.BY_ORDER:
-            if self.rc.max_react_loop != len(self.actions):
-                self.rc.max_react_loop = len(self.actions)
-            self._set_state(self.rc.state + 1)
-            return self.rc.state >= 0 and self.rc.state < len(self.actions)
-
-        prompt = self._get_prefix()
-        prompt += STATE_TEMPLATE.format(
-            history=self.rc.history,
-            states="\n".join(self.states),
-            n_states=len(self.states) - 1,
-            previous_state=self.rc.state,
-        )
-
-        next_state = await self.llm.aask(prompt)
-        next_state = extract_state_value_from_output(next_state)
-        logger.debug(f"{prompt=}")
-
-        if (not next_state.isdigit() and next_state != "-1") or int(next_state) not in range(-1, len(self.states)):
-            logger.warning(f"Invalid answer of state, {next_state=}, will be set to -1")
-            next_state = -1
-        else:
-            next_state = int(next_state)
-            if next_state == -1:
-                logger.info(f"End actions with {next_state=}")
-        self._set_state(next_state)
-        return True
 
     async def _act(self) -> Message:
-        logger.info(f"{self._setting}: to do {self.rc.todo}({self.rc.todo.name})")
-        response = await self.rc.todo.run(self.rc.history)
-        if isinstance(response, (ActionOutput, ActionNode)):
-            msg = AIMessage(
-                content=response.content,
-                instruct_content=response.instruct_content,
-                cause_by=self.rc.todo,
-                sent_from=self,
-            )
-        elif isinstance(response, Message):
-            msg = response
-        else:
-            msg = AIMessage(content=response or "", cause_by=self.rc.todo, sent_from=self)
-        self.rc.memory.add(msg)
+        action_name = self.rc.todo.name if self.rc.todo else None
+        with span(
+            label("role.act", role=self._setting, action=action_name), color="yellow"
+        ):
+            logger.info(f"{self._setting}: to do {self.rc.todo}({self.rc.todo.name})")
+            response = await self.rc.todo.run(self.rc.history)
+            if isinstance(response, (ActionOutput, ActionNode)):
+                msg = AIMessage(
+                    content=response.content,
+                    instruct_content=response.instruct_content,
+                    cause_by=self.rc.todo,
+                    sent_from=self,
+                )
+            elif isinstance(response, Message):
+                msg = response
+            else:
+                msg = AIMessage(
+                    content=response or "", cause_by=self.rc.todo, sent_from=self
+                )
+            self.rc.memory.add(msg)
 
-        return msg
+            return msg
 
     async def _observe(self) -> int:
         """Prepare new messages for processing from the message buffer and other sources."""
-        # Read unprocessed messages from the msg buffer.
-        news = []
-        if self.recovered and self.latest_observed_msg:
-            news = self.rc.memory.find_news(observed=[self.latest_observed_msg], k=10)
-        if not news:
-            news = self.rc.msg_buffer.pop_all()
-        # Store the read messages in your own memory to prevent duplicate processing.
-        old_messages = [] if not self.enable_memory else self.rc.memory.get()
-        # Filter in messages of interest.
-        self.rc.news = [
-            n for n in news if (n.cause_by in self.rc.watch or self.name in n.send_to) and n not in old_messages
-        ]
-        if self.observe_all_msg_from_buffer:
-            # save all new messages from the buffer into memory, the role may not react to them but can be aware of them
-            self.rc.memory.add_batch(news)
-        else:
-            # only save messages of interest into memory
-            self.rc.memory.add_batch(self.rc.news)
-        self.latest_observed_msg = self.rc.news[-1] if self.rc.news else None  # record the latest observed msg
+        with span(label("role.observe", role=self._setting), color="green"):
+            # Read unprocessed messages from the msg buffer.
+            news = []
+            if self.recovered and self.latest_observed_msg:
+                news = self.rc.memory.find_news(
+                    observed=[self.latest_observed_msg], k=10
+                )
+            if not news:
+                news = self.rc.msg_buffer.pop_all()
+            # Store the read messages in your own memory to prevent duplicate processing.
+            old_messages = [] if not self.enable_memory else self.rc.memory.get()
+            # Filter in messages of interest.
+            self.rc.news = [
+                n
+                for n in news
+                if (n.cause_by in self.rc.watch or self.name in n.send_to)
+                and n not in old_messages
+            ]
+            if self.observe_all_msg_from_buffer:
+                # save all new messages from the buffer into memory, the role may not react to them but can be aware of them
+                self.rc.memory.add_batch(news)
+            else:
+                # only save messages of interest into memory
+                self.rc.memory.add_batch(self.rc.news)
+            self.latest_observed_msg = (
+                self.rc.news[-1] if self.rc.news else None
+            )  # record the latest observed msg
 
-        # Design Rules:
-        # If you need to further categorize Message objects, you can do so using the Message.set_meta function.
-        # msg_buffer is a receiving buffer, avoid adding message data and operations to msg_buffer.
-        news_text = [f"{i.role}: {i.content[:20]}..." for i in self.rc.news]
-        if news_text:
-            logger.debug(f"{self._setting} observed: {news_text}")
-        return len(self.rc.news)
+            # Design Rules:
+            # If you need to further categorize Message objects, you can do so using the Message.set_meta function.
+            # msg_buffer is a receiving buffer, avoid adding message data and operations to msg_buffer.
+            news_text = [f"{i.role}: {i.content[:20]}..." for i in self.rc.news]
+            if news_text:
+                logger.debug(f"{self._setting} observed: {news_text}")
+            return len(self.rc.news)
 
     def publish_message(self, msg):
         """If the role belongs to env, then the role's messages will be broadcast to env"""
@@ -435,7 +476,9 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
             msg.send_to.remove(MESSAGE_ROUTE_TO_SELF)
         if not msg.sent_from or msg.sent_from == MESSAGE_ROUTE_TO_SELF:
             msg.sent_from = any_to_str(self)
-        if all(to in {any_to_str(self), self.name} for to in msg.send_to):  # Message to myself
+        if all(
+            to in {any_to_str(self), self.name} for to in msg.send_to
+        ):  # Message to myself
             self.put_message(msg)
             return
         if not self.rc.env:
@@ -456,44 +499,72 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
         This is the standard think-act loop in the ReAct paper, which alternates thinking and acting in task solving, i.e. _think -> _act -> _think -> _act -> ...
         Use llm to select actions in _think dynamically
         """
-        actions_taken = 0
-        rsp = AIMessage(content="No actions taken yet", cause_by=Action)  # will be overwritten after Role _act
-        while actions_taken < self.rc.max_react_loop:
-            # think
-            has_todo = await self._think()
-            if not has_todo:
-                break
-            # act
-            logger.debug(f"{self._setting}: {self.rc.state=}, will do {self.rc.todo}")
-            rsp = await self._act()
-            actions_taken += 1
-        return rsp  # return output from the last action
+        with span(
+            label(
+                "role.react_loop", role=self._setting, max_loop=self.rc.max_react_loop
+            ),
+            color="green",
+        ):
+            actions_taken = 0
+            rsp = AIMessage(
+                content="No actions taken yet", cause_by=Action
+            )  # will be overwritten after Role _act
+            while actions_taken < self.rc.max_react_loop:
+                # think
+                has_todo = await self._think()
+                if not has_todo:
+                    break
+                # act
+                logger.debug(
+                    f"{self._setting}: {self.rc.state=}, will do {self.rc.todo}"
+                )
+                rsp = await self._act()
+                actions_taken += 1
+            return rsp  # return output from the last action
 
     async def _plan_and_act(self) -> Message:
         """first plan, then execute an action sequence, i.e. _think (of a plan) -> _act -> _act -> ... Use llm to come up with the plan dynamically."""
-        if not self.planner.plan.goal:
-            # create initial plan and update it until confirmation
-            goal = self.rc.memory.get()[-1].content  # retreive latest user requirement
-            await self.planner.update_plan(goal=goal)
+        with span(label("role.plan_and_act", role=self._setting), color="green"):
+            if not self.planner.plan.goal:
+                # create initial plan and update it until confirmation
+                goal = self.rc.memory.get()[
+                    -1
+                ].content  # retreive latest user requirement
+                with span(
+                    label("planner.update_plan", role=self._setting, goal=goal),
+                    color="purple",
+                ):
+                    await self.planner.update_plan(goal=goal)
 
-        # take on tasks until all finished
-        while self.planner.current_task:
-            task = self.planner.current_task
-            logger.info(f"ready to take on task {task}")
+            # take on tasks until all finished
+            while self.planner.current_task:
+                task = self.planner.current_task
+                logger.info(f"ready to take on task {task}")
 
-            # take on current task
-            task_result = await self._act_on_task(task)
+                with span(
+                    label(
+                        "planner.task",
+                        role=self._setting,
+                        task_id=getattr(task, "task_id", None),
+                        task_type=getattr(task, "task_type", None),
+                    ),
+                    color="purple",
+                ):
+                    # take on current task
+                    task_result = await self._act_on_task(task)
 
-            # process the result, such as reviewing, confirming, plan updating
-            await self.planner.process_task_result(task_result)
+                    # process the result, such as reviewing, confirming, plan updating
+                    await self.planner.process_task_result(task_result)
 
-        rsp = self.planner.get_useful_memories()[0]  # return the completed plan as a response
-        rsp.role = "assistant"
-        rsp.sent_from = self._setting
+            rsp = self.planner.get_useful_memories()[
+                0
+            ]  # return the completed plan as a response
+            rsp.role = "assistant"
+            rsp.sent_from = self._setting
 
-        self.rc.memory.add(rsp)  # add to persistent memory
+            self.rc.memory.add(rsp)  # add to persistent memory
 
-        return rsp
+            return rsp
 
     async def _act_on_task(self, current_task: Task) -> TaskResult:
         """Taking specific action to handle one task in plan
@@ -511,16 +582,25 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
 
     async def react(self) -> Message:
         """Entry to one of three strategies by which Role reacts to the observed Message"""
-        if self.rc.react_mode == RoleReactMode.REACT or self.rc.react_mode == RoleReactMode.BY_ORDER:
-            rsp = await self._react()
-        elif self.rc.react_mode == RoleReactMode.PLAN_AND_ACT:
-            rsp = await self._plan_and_act()
-        else:
-            raise ValueError(f"Unsupported react mode: {self.rc.react_mode}")
-        self._set_state(state=-1)  # current reaction is complete, reset state to -1 and todo back to None
-        if isinstance(rsp, AIMessage):
-            rsp.with_agent(self._setting)
-        return rsp
+        with span(
+            label("role.react", role=self._setting, mode=self.rc.react_mode),
+            color="green",
+        ):
+            if (
+                self.rc.react_mode == RoleReactMode.REACT
+                or self.rc.react_mode == RoleReactMode.BY_ORDER
+            ):
+                rsp = await self._react()
+            elif self.rc.react_mode == RoleReactMode.PLAN_AND_ACT:
+                rsp = await self._plan_and_act()
+            else:
+                raise ValueError(f"Unsupported react mode: {self.rc.react_mode}")
+            self._set_state(
+                state=-1
+            )  # current reaction is complete, reset state to -1 and todo back to None
+            if isinstance(rsp, AIMessage):
+                rsp.with_agent(self._setting)
+            return rsp
 
     def get_memories(self, k=0) -> list[Message]:
         """A wrapper to return the most recent k memories of this role, return all when k=0"""
@@ -529,29 +609,30 @@ class Role(BaseRole, SerializationMixin, ContextMixin, BaseModel):
     @role_raise_decorator
     async def run(self, with_message=None) -> Message | None:
         """Observe, and think and act based on the results of the observation"""
-        if with_message:
-            msg = None
-            if isinstance(with_message, str):
-                msg = Message(content=with_message)
-            elif isinstance(with_message, Message):
-                msg = with_message
-            elif isinstance(with_message, list):
-                msg = Message(content="\n".join(with_message))
-            if not msg.cause_by:
-                msg.cause_by = UserRequirement
-            self.put_message(msg)
-        if not await self._observe():
-            # If there is no new information, suspend and wait
-            logger.debug(f"{self._setting}: no news. waiting.")
-            return
+        with span(label("role.run", role=self._setting), color="green"):
+            if with_message:
+                msg = None
+                if isinstance(with_message, str):
+                    msg = Message(content=with_message)
+                elif isinstance(with_message, Message):
+                    msg = with_message
+                elif isinstance(with_message, list):
+                    msg = Message(content="\n".join(with_message))
+                if not msg.cause_by:
+                    msg.cause_by = UserRequirement
+                self.put_message(msg)
+            if not await self._observe():
+                # If there is no new information, suspend and wait
+                logger.debug(f"{self._setting}: no news. waiting.")
+                return
 
-        rsp = await self.react()
+            rsp = await self.react()
 
-        # Reset the next action to be taken.
-        self.set_todo(None)
-        # Send the response message to the Environment object to have it relay the message to the subscribers.
-        self.publish_message(rsp)
-        return rsp
+            # Reset the next action to be taken.
+            self.set_todo(None)
+            # Send the response message to the Environment object to have it relay the message to the subscribers.
+            self.publish_message(rsp)
+            return rsp
 
     @property
     def is_idle(self) -> bool:
