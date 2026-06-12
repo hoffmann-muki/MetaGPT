@@ -62,6 +62,9 @@ The content around the specified line is:
 {context}
 Pay attention to the new content. Ensure that it aligns with the new parameters.
 """
+STALE_FULL_FILE_EDIT_RECOVERY = """Recovered from stale edit anchors for a whole-file replacement.
+The requested range covers the entire file and the proposed content starts with the current first line.
+"""
 SUCCESS_EDIT_INFO = """
 [File: {file_name} ({n_total_lines} lines total after edit)]
 {window_after_applied}
@@ -487,6 +490,25 @@ class Editor(BaseModel):
         content = "".join(new_lines)
         return content, n_added_lines
 
+    @staticmethod
+    def _is_safe_stale_full_file_replacement(
+        lines: list[str],
+        first_replaced_line_number: int,
+        last_replaced_line_number: int,
+        new_content: str,
+    ) -> bool:
+        """Allow a stale first-line anchor only for unambiguous whole-file rewrites."""
+        if not lines:
+            return False
+        if first_replaced_line_number != 1 or last_replaced_line_number != len(lines):
+            return False
+
+        new_lines = str(new_content or "").splitlines()
+        if not new_lines:
+            return False
+
+        return lines[0].rstrip() == new_lines[0].rstrip()
+
     def _get_indentation_info(self, content, first_line):
         """
         The indentation of the first insert line and the previous line, along with guidance for the next attempt.
@@ -810,6 +832,19 @@ class Editor(BaseModel):
                         context=context.strip(),
                     )
         if mismatch_error:
+            if self._is_safe_stale_full_file_replacement(
+                lines=lines,
+                first_replaced_line_number=first_replaced_line_number,
+                last_replaced_line_number=last_replaced_line_number,
+                new_content=new_content,
+            ):
+                ret_str = self._edit_file_impl(
+                    file_name,
+                    start=1,
+                    end=total_lines,
+                    content=new_content,
+                )
+                return STALE_FULL_FILE_EDIT_RECOVERY + ret_str
             raise ValueError(mismatch_error)
         ret_str = self._edit_file_impl(
             file_name,

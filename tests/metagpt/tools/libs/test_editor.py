@@ -580,6 +580,45 @@ def test_edit_file_by_replace_mismatch(temp_py_file):
     assert str(match_error.value).strip() == MISMATCH_ERROR.strip()
 
 
+def test_edit_file_by_replace_recovers_safe_stale_full_file_anchor(tmp_path):
+    file_path = tmp_path / "script.js"
+    file_path.write_text(
+        "const gridSize = 4;\n"
+        "let score = 0;\n"
+        "\n"
+        "function initGame() {\n"
+        "    renderBoard(createBoard());\n"
+        "}\n"
+        "\n"
+        "initGame();\n"
+    )
+    new_content = (
+        "const gridSize = 4;\n"
+        "let score = 0;\n"
+        "let board = [];\n"
+        "\n"
+        "function initGame() {\n"
+        "    board = createBoard();\n"
+        "    renderBoard(board);\n"
+        "}\n"
+        "\n"
+        "initGame();"
+    )
+
+    editor = Editor()
+    result = editor.edit_file_by_replace(
+        file_name=str(file_path),
+        first_replaced_line_number=1,
+        first_replaced_line_content="// Add JavaScript game logic here",
+        last_replaced_line_number=8,
+        last_replaced_line_content="initGame();",
+        new_content=new_content,
+    )
+
+    assert result.startswith("Recovered from stale edit anchors")
+    assert file_path.read_text().strip() == new_content
+
+
 def test_append_file(temp_file_path):
     editor = Editor()
     # 写入初始内容

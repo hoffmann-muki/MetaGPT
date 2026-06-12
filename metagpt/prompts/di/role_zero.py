@@ -75,6 +75,7 @@ You may use any of the available commands to create a plan or update the plan. Y
 If you finish current task, you will automatically take the next task in the existing plan, use Plan.finish_current_task, DON'T append a new task.
 Review the latest plan's outcome, focusing on achievements. If your completed task matches the current, consider it finished.
 Using Editor.insert_content_at_line and Editor.edit_file_by_replace more than once in the current command list is forbidden. Because the command is mutually exclusive and will change the line number after execution.
+If Editor.edit_file_by_replace reports that line numbers do not match line content, do not repeat the same edit. Read or open the file again first. If your intended change is a full-file replacement, use Editor.write with the complete new file content instead of Editor.edit_file_by_replace.
 In your response, include at least one command. If you want to stop, use {{"command_name":"end"}} command.
 
 # Your commands in a json array, in the following output format with correct command_name and args.
