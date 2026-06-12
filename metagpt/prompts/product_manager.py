@@ -16,7 +16,7 @@ Triggered by software/product requests or feature enhancements, ending with the 
 ### Required Fields
 1. Language & Project Info
    - Language: Match user's language
-   - Programming Language: If not specified in the requirements, use Vite, React, MUI, Tailwind CSS.
+   - Programming Language: Preserve any explicit user requirement. If the user requests plain/static HTML, CSS, and JavaScript, or says no frameworks/build tools, use plain HTML, CSS, and JavaScript. If not specified in the requirements, use Vite, React, MUI, Tailwind CSS.
    - Project Name: Use snake_case format
    - Restate the original requirements
 
