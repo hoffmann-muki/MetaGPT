@@ -4,7 +4,7 @@
 
 import json
 from enum import Enum, auto
-from typing import AsyncGenerator, Optional, Tuple
+from typing import Any, AsyncGenerator, Optional, Tuple
 
 from metagpt.configs.llm_config import LLMConfig, LLMType
 from metagpt.const import USE_CONFIG_TIMEOUT
@@ -43,6 +43,17 @@ class OllamaMessageBase:
 
     def get_choice(self, to_choice_dict: dict) -> str:
         raise NotImplementedError
+
+    def _normalize_message(self, message: Any) -> dict:
+        if isinstance(message, dict):
+            return message
+        if hasattr(message, "to_dict"):
+            return message.to_dict()
+        if hasattr(message, "role") and hasattr(message, "content"):
+            return {"role": message.role, "content": message.content}
+        raise TypeError(
+            f"Unsupported message type for Ollama: {type(message).__name__}"
+        )
 
     def _parse_input_msg(self, msg: dict) -> Tuple[Optional[str], Optional[str]]:
         if "type" in msg:
@@ -86,6 +97,7 @@ class OllamaMessageChat(OllamaMessageBase, metaclass=OllamaMessageMeta):
     def apply(self, messages: list[dict]) -> dict:
         messes = []
         for message in messages:
+            message = self._normalize_message(message)
             content = message["content"]
             if isinstance(content, list):
                 prompts = []
@@ -126,7 +138,7 @@ class OllamaMessageGenerate(OllamaMessageChat, metaclass=OllamaMessageMeta):
         return "/generate"
 
     def apply(self, messages: list[dict]) -> dict:
-        content = messages[0]["content"]
+        content = self._normalize_message(messages[0])["content"]
         prompts = []
         images = []
         if isinstance(content, list):
@@ -161,7 +173,7 @@ class OllamaMessageEmbeddings(OllamaMessageBase, metaclass=OllamaMessageMeta):
         return "/embeddings"
 
     def apply(self, messages: list[dict]) -> dict:
-        content = messages[0]["content"]
+        content = self._normalize_message(messages[0])["content"]
         prompts = []  # NOTE: not support image to embedding
         if isinstance(content, list):
             for msg in content:
@@ -183,7 +195,7 @@ class OllamaMessageEmbed(OllamaMessageEmbeddings, metaclass=OllamaMessageMeta):
         return "/embed"
 
     def apply(self, messages: list[dict]) -> dict:
-        content = messages[0]["content"]
+        content = self._normalize_message(messages[0])["content"]
         prompts = []  # NOTE: not support image to embedding
         if isinstance(content, list):
             for msg in content:

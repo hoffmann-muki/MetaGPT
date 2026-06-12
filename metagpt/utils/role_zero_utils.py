@@ -66,7 +66,12 @@ async def parse_images(memory: list[Message], llm) -> list[Message]:
 
 
 async def check_duplicates(
-    req: list[dict], command_rsp: str, rsp_hist: list[str], llm, respond_language: str, check_window: int = 10
+    req: list[dict],
+    command_rsp: str,
+    rsp_hist: list[str],
+    llm,
+    respond_language: str,
+    check_window: int = 10,
 ) -> str:
     past_rsp = rsp_hist[-check_window:]
     if command_rsp in past_rsp and '"command_name": "end"' not in command_rsp:
@@ -81,9 +86,8 @@ async def check_duplicates(
                 # Detect the duplicate of the 'Plan.finish_current_task' command, and use the 'end' command to finish the task.
                 logger.warning(f"Duplicate response detected: {command_rsp}")
                 return END_COMMAND
-            problem = await llm.aask(
-                req + [UserMessage(content=SUMMARY_PROBLEM_WHEN_DUPLICATE.format(language=respond_language))]
-            )
+            summary_req = req + [UserMessage(content=SUMMARY_PROBLEM_WHEN_DUPLICATE.format(language=respond_language))]
+            problem = await llm.aask(llm.format_msg(summary_req))
             ASK_HUMAN_COMMAND[0]["args"]["question"] = ASK_HUMAN_GUIDANCE_FORMAT.format(problem=problem).strip()
             ask_human_command = "```json\n" + json.dumps(ASK_HUMAN_COMMAND, indent=4, ensure_ascii=False) + "\n```"
             return ask_human_command

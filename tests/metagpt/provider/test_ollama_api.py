@@ -8,6 +8,7 @@ from typing import Any, AsyncGenerator, Tuple
 import pytest
 
 from metagpt.provider.ollama_api import OllamaLLM, OpenAIResponse
+from metagpt.schema import UserMessage
 from tests.metagpt.provider.mock_llm_config import mock_llm_config
 from tests.metagpt.provider.req_resp_const import (
     llm_general_chat_funcs_test,
@@ -91,4 +92,15 @@ def test_ollama_chat_converts_multimodal_messages_to_ollama_shape():
 
     assert payload["messages"] == [
         {"role": "user", "content": "Describe this.", "images": ["abc123"]}
+    ]
+
+
+def test_ollama_chat_accepts_metagpt_message_objects():
+    ollama_llm = OllamaLLM(mock_llm_config)
+    payload = ollama_llm.ollama_message.apply(
+        [UserMessage(content="Summarize the duplicate response.")]
+    )
+
+    assert payload["messages"] == [
+        {"role": "user", "content": "Summarize the duplicate response."}
     ]
