@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import traceback
 from typing import Tuple
@@ -22,6 +23,12 @@ from metagpt.utils.repair_llm_raw_output import (
     repair_escape_error,
     repair_llm_raw_output,
 )
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _auto_end_on_duplicate() -> bool:
+    return os.getenv("METAGPT_AUTO_END_ON_DUPLICATE", "").lower() in _TRUE_VALUES
 
 
 async def parse_browser_actions(memory: list[Message], browser) -> list[Message]:
@@ -85,6 +92,9 @@ async def check_duplicates(
             if '"command_name": "Plan.finish_current_task",' in command_rsp:
                 # Detect the duplicate of the 'Plan.finish_current_task' command, and use the 'end' command to finish the task.
                 logger.warning(f"Duplicate response detected: {command_rsp}")
+                return END_COMMAND
+            if _auto_end_on_duplicate():
+                logger.warning("Duplicate response threshold reached; auto-ending instead of asking human.")
                 return END_COMMAND
             summary_req = req + [UserMessage(content=SUMMARY_PROBLEM_WHEN_DUPLICATE.format(language=respond_language))]
             problem = await llm.aask(llm.format_msg(summary_req))
