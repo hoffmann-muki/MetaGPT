@@ -133,6 +133,13 @@ async def parse_commands(command_rsp: str, llm, exclusive_tool_commands: list[st
     if isinstance(commands, dict):
         commands = commands["commands"] if "commands" in commands else [commands]
 
+    if not isinstance(commands, list) or any(
+        not isinstance(command, dict) or "command_name" not in command for command in commands
+    ):
+        error_msg = "Failed to parse commands: each command must be a JSON object with a 'command_name' field."
+        logger.warning(f"{error_msg} Parsed value: {commands}")
+        return error_msg, False, command_rsp
+
     # Set the exclusive command flag to False.
     command_flag = [command["command_name"] not in exclusive_tool_commands for command in commands]
     if command_flag.count(False) > 1:

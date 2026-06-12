@@ -84,24 +84,28 @@ class OllamaMessageChat(OllamaMessageBase, metaclass=OllamaMessageMeta):
         return "/chat"
 
     def apply(self, messages: list[dict]) -> dict:
-        content = messages[0]["content"]
-        prompts = []
-        images = []
-        if isinstance(content, list):
-            for msg in content:
-                prompt, image = self._parse_input_msg(msg)
-                if prompt:
-                    prompts.append(prompt)
-                if image:
-                    images.append(image)
-        else:
-            prompts.append(content)
         messes = []
-        for prompt in prompts:
-            if len(images) > 0:
-                messes.append({"role": "user", "content": prompt, "images": images})
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, list):
+                prompts = []
+                images = []
+                for msg in content:
+                    prompt, image = self._parse_input_msg(msg)
+                    if prompt:
+                        prompts.append(prompt)
+                    if image:
+                        images.append(image)
+                parsed_message = {
+                    "role": message["role"],
+                    "content": "\n".join(prompts),
+                }
+                if images:
+                    parsed_message["images"] = images
             else:
-                messes.append({"role": "user", "content": prompt})
+                parsed_message = {"role": message["role"], "content": content}
+            messes.append(parsed_message)
+
         sends = {"model": self.model, "messages": messes}
         sends.update(self.additional_kwargs)
         return sends
@@ -204,7 +208,7 @@ class OllamaLLM(BaseLLM):
         self.config = config
         self.model = config.model
         self.http_method = "post"
-        self.use_system_prompt = False
+        self.use_system_prompt = config.use_system_prompt
         self.cost_manager = TokenCostManager()
         self.__init_ollama(config)
 

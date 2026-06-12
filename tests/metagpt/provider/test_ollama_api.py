@@ -51,3 +51,44 @@ async def test_gemini_acompletion(mocker):
     assert resp == resp_cont
 
     await llm_general_chat_funcs_test(ollama_llm, prompt, messages, resp_cont)
+
+
+def test_ollama_chat_preserves_system_and_context_messages():
+    ollama_llm = OllamaLLM(mock_llm_config)
+    payload = ollama_llm.ollama_message.apply(
+        [
+            {"role": "system", "content": "Return command JSON only."},
+            {"role": "user", "content": "Build a 2048 game."},
+            {"role": "assistant", "content": "```json\n[]\n```"},
+            {"role": "user", "content": "Continue."},
+        ]
+    )
+
+    assert payload["messages"] == [
+        {"role": "system", "content": "Return command JSON only."},
+        {"role": "user", "content": "Build a 2048 game."},
+        {"role": "assistant", "content": "```json\n[]\n```"},
+        {"role": "user", "content": "Continue."},
+    ]
+
+
+def test_ollama_chat_converts_multimodal_messages_to_ollama_shape():
+    ollama_llm = OllamaLLM(mock_llm_config)
+    payload = ollama_llm.ollama_message.apply(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,abc123"},
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert payload["messages"] == [
+        {"role": "user", "content": "Describe this.", "images": ["abc123"]}
+    ]
