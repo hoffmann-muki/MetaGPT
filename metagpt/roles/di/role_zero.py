@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import os
 import re
 import traceback
 from datetime import datetime
@@ -50,12 +49,6 @@ from metagpt.utils.role_zero_utils import (
     parse_editor_result,
     parse_images,
 )
-
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-
-
-def _auto_end_on_ask_human() -> bool:
-    return os.getenv("METAGPT_AUTO_END_ON_ASK_HUMAN", "").lower() in _TRUE_VALUES
 
 
 @register_tool(include_functions=["ask_human", "reply_to_human"])
@@ -438,12 +431,6 @@ class RoleZero(Role):
         elif cmd["command_name"] == "end":
             command_output = await self._end()
         elif cmd["command_name"] == "RoleZero.ask_human":
-            if _auto_end_on_ask_human():
-                logger.warning("Auto-ending instead of waiting for human input.")
-                end_output = "Auto-ended because RoleZero.ask_human was requested during a non-interactive run."
-                end_output += "\nCommand end executed:"
-                end_output += await self._end()
-                return end_output
             human_response = await self.ask_human(**cmd["args"])
             if human_response.strip().lower().endswith(("stop", "<stop>")):
                 human_response += "The user has asked me to stop because I have encountered a problem."

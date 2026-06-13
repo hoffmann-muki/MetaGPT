@@ -65,12 +65,6 @@ Pay attention to the new content. Ensure that it aligns with the new parameters.
 STALE_FULL_FILE_EDIT_RECOVERY = """Recovered from stale edit anchors for a whole-file replacement.
 The requested range covers the entire file and the proposed content starts with the current first line.
 """
-SOFT_MISMATCH_ERROR = """[Edit rejected: line/content mismatch]
-{mismatch_error}
-Your changes have NOT been applied.
-Do not repeat the same Editor.edit_file_by_replace command.
-Open/read the file and use the displayed line numbers, or use Editor.write with the complete file content if you are replacing most/all of the file.
-"""
 SUCCESS_EDIT_INFO = """
 [File: {file_name} ({n_total_lines} lines total after edit)]
 {window_after_applied}
@@ -88,13 +82,6 @@ class FileBlock(BaseModel):
 
 class LineNumberError(Exception):
     pass
-
-
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-
-
-def _soft_mismatch_errors_enabled() -> bool:
-    return os.getenv("METAGPT_EDITOR_SOFT_MISMATCH", "").lower() in _TRUE_VALUES
 
 
 @register_tool(
@@ -858,8 +845,6 @@ class Editor(BaseModel):
                     content=new_content,
                 )
                 return STALE_FULL_FILE_EDIT_RECOVERY + ret_str
-            if _soft_mismatch_errors_enabled():
-                return SOFT_MISMATCH_ERROR.format(mismatch_error=mismatch_error.strip())
             raise ValueError(mismatch_error)
         ret_str = self._edit_file_impl(
             file_name,

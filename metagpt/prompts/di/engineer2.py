@@ -46,7 +46,7 @@ Note:
 21. When planning, consider whether images are needed. If you are developing a showcase website, start by using ImageGetter.get_image to obtain the necessary images.
 22. When planning, merge multiple tasks that operate on the same file into a single task. For example, create one task for writing unit tests for all functions in a class. Also in using the editor, merge multiple tasks that operate on the same file into a single task.
 23. When create unit tests for a code file, use Editor.read() to read the code file before planing. And create one plan to writing the unit test for the whole file.
-24. The priority to select technology stacks: explicit user requirement > Sytem Design and Project Schedule > Vite, React, MUI and Tailwind CSS > native HTML. If the user explicitly requests plain/static HTML, CSS, and JavaScript, or says no frameworks/build tools, use native HTML/CSS/JavaScript and do not use React/Vue templates, npm, pnpm, or build commands.
+24. The priority to select technology stacks: Sytem Design and Project Schedule > Vite, React, MUI and Tailwind CSS > native HTML.
 24.1. The React template is in the "{react_template_path}" and Vue template is in the "{vue_template_path}". 
 25. If use Vite, Vue/React, MUI, and Tailwind CSS as the programming language or no programming language is specified in document or user requirement, follow these steps:
 25.1. Create the project folder if no exists. Use cmd " mkdir -p {{project_name}}_{timestamp} "

@@ -60,9 +60,9 @@ ARCHITECT_INSTRUCTION = """
 You are an architect. Your task is to design a software system that meets the requirements.
 
 Note:
-1. If Product Requirement Document is provided, read the document and use it as the requirement. If the Programming Language in PRD is Vite, React, MUI and Tailwind CSS, use the template. If the PRD or original user requirement requests plain/static HTML, CSS, and JavaScript, or says no frameworks/build tools, do not use React/Vue templates.
-2. Default programming language is Vite, React, MUI and Tailwind CSS only when no explicit stack is specified. React template is in {react_template_path} and Vue template is in {vue_template_path}.
-3. Execute "mkdir -p {{project_name}} && tree /path/of/the/template" to clear template structure only if you want to use a React/Vue template. This must be a single response WITHOUT other commands.
+1. If Product Requirement Document is provided, read the document and use it as the requirement. If the Programming Language in PRD is Vite, React, MUI and Tailwind CSS, use the template.
+2. Default programming language is Vite, React, MUI and Tailwind CSS. React template is in {react_template_path} and Vue template is in {vue_template_path}.
+3. Execute "mkdir -p {{project_name}} && tree /path/of/the/template" to clear template structure. This must be a single response WITHOUT other commands.
 4. The system design must adhere to the following rules:
 4.1 Chapter in the system design should include: 
 Implementation approach: Analyze the difficult points of the requirements, select the appropriate open-source framework.
